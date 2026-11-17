@@ -17,7 +17,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from analysis import (
-    DataError, filename_pyruvate, fit_all_models, fit_line,
+    DataError, apparent_postmix_fraction, filename_pyruvate, fit_all_models, fit_line,
     fit_substrate_inhibition, read_cary_csv, recommended_windows,
     signal_slope_to_velocity, substrate_inhibition,
 )
@@ -55,8 +55,7 @@ with st.sidebar:
         a_col = st.number_input('Absorbance column (1 = first)', min_value=1, value=2)
         time_unit = st.selectbox('Cary time units', ['seconds','minutes'], index=0)
     st.header('4 · Fit range')
-    dead_time_s = st.number_input('Exclude data before this time (s)',
-                                  min_value=0.0, value=5.0, step=1.0)
+    st.caption('Mixing cutoff defaults to 15 seconds and can be adjusted separately for each trace below.')
 
 st.markdown('**Models:** two selected linear windows · continuous two-slope breakpoint · '
             'smooth exponential slope transition · single straight-line reference.')
@@ -64,7 +63,7 @@ st.markdown('**Models:** two selected linear windows · continuous two-slope bre
 if not uploaded:
     st.subheader('Start with a few traces')
     st.markdown('Upload several Cary CSV files. The app tries to read [pyruvate] from filenames '
-                'such as `RS_WT_53,3mM_A.csv`; you can edit concentrations in the table. '
+                'such as `RS_WT_53,3mM_A.csv`; you can edit concentrations in the controls. '
                 'For a first check, use low- and high-pyruvate traces from the same enzyme.')
     st.markdown('The downloaded project contains **10 synthetic example CSVs** in `sample_data/` '
                 'for testing the interface. These are not experimental measurements.')
@@ -130,7 +129,17 @@ current = st.selectbox('Inspect and edit windows for', names,
 
 for name, obj in parsed.items():
     prefix = obj['uid']
-    defaults = recommended_windows(obj['df'].time_s.to_numpy())
+    tm = obj['df'].time_s.to_numpy(float)
+    lo, hi = float(tm.min()), float(tm.max())
+    dt = float(np.median(np.diff(np.unique(tm))))
+    cutoff_key = f'{prefix}_mixing_cutoff'
+    if cutoff_key not in st.session_state:
+        st.session_state[cutoff_key] = float(min(15., max(lo, hi-15*dt)))
+    try:
+        defaults = recommended_windows(tm, cutoff_s=st.session_state[cutoff_key])
+    except DataError:
+        defaults = {'early_start': lo, 'early_end': hi,
+                    'late_start': lo, 'late_end': hi}
     for part, value in defaults.items():
         key = f'{prefix}_{part}'
         if key not in st.session_state:
@@ -138,6 +147,13 @@ for name, obj in parsed.items():
 
 curr_uid = parsed[current]['uid']; curr_df = parsed[current]['df']
 tmin, tmax = float(curr_df.time_s.min()), float(curr_df.time_s.max())
+st.number_input('Exclude mixing artifact before this time (s) — for this trace',
+                min_value=0.0, max_value=tmax, step=1.0,
+                key=f'{curr_uid}_mixing_cutoff',
+                help='Default 15 s. The mixing period is excluded from all fits for this trace. '
+                     'You may choose a different cutoff for each file.')
+if float(st.session_state[f'{curr_uid}_early_start']) < float(st.session_state[f'{curr_uid}_mixing_cutoff']):
+    st.caption('Early start currently precedes the mixing cutoff; move it later to use this trace.')
 c1,c2,c3,c4 = st.columns(4)
 with c1:
     st.number_input('Early start (s)', min_value=tmin, max_value=tmax,
@@ -152,19 +168,21 @@ with c4:
     st.number_input('Late end (s)', min_value=tmin, max_value=tmax,
                     step=0.5, key=f'{curr_uid}_late_end')
 
-if st.button('Copy these windows to all included traces', help='Useful for runs sampled over the same time interval'):
+if st.button('Copy mixing cutoff and fitting windows to all included traces', help='Useful for runs sampled over the same time interval'):
     for name in names:
         if name == current:
             continue
         dest = parsed[name]
         lo, hi = float(dest['df'].time_s.min()), float(dest['df'].time_s.max())
-        for part in ('early_start','early_end','late_start','late_end'):
+        for part in ('mixing_cutoff','early_start','early_end','late_start','late_end'):
             st.session_state[f"{dest['uid']}_{part}"] = float(np.clip(
                 st.session_state[f'{curr_uid}_{part}'], lo, hi))
-    st.success('Window limits copied. Inspect other traces before interpreting results.')
+    st.success('Cutoff and window limits copied. Inspect each trace before interpreting results.')
 
-st.caption('The two linear fits use only the points inside each selected window. '
-           'The segmented and exponential models use all retained points after the mixing/dead-time cutoff.')
+st.caption('All fits exclude the selected mixing period (default 15 s). '
+           'The two linear fits use their selected windows. The segmented and exponential models '
+           'use the remaining time course. Later-phase fits are intentionally *not* restricted '
+           'to the initial-rate (<10% conversion) regime.')
 
 results = []
 fits = {}
@@ -177,11 +195,14 @@ for _, row in selected_rows.iterrows():
     except (ValueError, TypeError):
         s = np.nan
     rec = {'file': name, 'enzyme': label, 'pyruvate_mM': s,
-           'n_points': len(t), 'issue': ''}
+           'n_points': len(t), 'issue': '', 'mixing_cutoff_s': float(st.session_state[f'{uid}_mixing_cutoff'])}
     early = late = models = None
     try:
         limits = {k: float(st.session_state[f'{uid}_{k}'])
                   for k in ('early_start','early_end','late_start','late_end')}
+        cutoff = float(st.session_state[f'{uid}_mixing_cutoff'])
+        if limits['early_start'] < cutoff or limits['late_start'] < cutoff:
+            raise DataError(f'A fitting window starts before mixing cutoff ({cutoff:g} s). Adjust the windows.')
         if limits['early_start'] >= limits['early_end'] or limits['late_start'] >= limits['late_end']:
             raise DataError('Time-window start must precede its end.')
         if limits['early_end'] > limits['late_start']:
@@ -198,7 +219,7 @@ for _, row in selected_rows.iterrows():
                    early_n=early['n'],late_n=late['n'],
                    early_start_s=early['start_s'],early_end_s=early['end_s'],
                    late_start_s=late['start_s'],late_end_s=late['end_s'])
-        models = fit_all_models(d['df'], dead_time_s=dead_time_s)
+        models = fit_all_models(d['df'], dead_time_s=cutoff)
         trans, seg = models['transition'], models['segmented']
         rec.update(k_obs_s_1=trans['k_obs_s_1'],
                    t_half_s=trans['t_half_s'],
@@ -215,10 +236,22 @@ for _, row in selected_rows.iterrows():
                    aicc_segmented=seg['aicc'],
                    aicc_exponential=trans['aicc'],
                    exponential_at_k_bound=trans['k_at_bound'])
-        rec['NADH_consumed_fraction_approx'] = max(0, a.max()-a.min())*1000/(extinction*path_cm*initial_nadh)
+        # Only changes AFTER the mixing cutoff are evaluated, never absolute A340.
+        # These are approximate NADH-equivalent changes, not true conversion:
+        # pyruvate and products may contribute to time-dependent absorbance.
+        postmix_t = t[t >= cutoff]
+        rec['apparent_fraction_to_early_end_postmix'] = apparent_postmix_fraction(
+            t, a, float(postmix_t[0]), limits['early_end'],
+            extinction, path_cm, initial_nadh)
+        rec['apparent_fraction_to_late_end_postmix'] = apparent_postmix_fraction(
+            t, a, float(postmix_t[0]), limits['late_end'],
+            extinction, path_cm, initial_nadh)
+        rec['apparent_fraction_full_postmix'] = apparent_postmix_fraction(
+            t, a, float(postmix_t[0]), float(postmix_t[-1]),
+            extinction, path_cm, initial_nadh)
         quality = []
-        if rec['NADH_consumed_fraction_approx'] > .1:
-            quality.append('>10% of initial NADH absorbance change')
+        if rec['apparent_fraction_to_early_end_postmix'] > .1:
+            quality.append('early window >10% apparent NADH-equivalent change after mixing; not an initial-rate window')
         if v1 <= 0 or v2 <= 0:
             quality.append('nonpositive phase velocity')
         if trans['k_at_bound']:
@@ -227,7 +260,7 @@ for _, row in selected_rows.iterrows():
     except (DataError, ValueError, np.linalg.LinAlgError) as exc:
         rec['issue'] = str(exc)
     results.append(rec)
-    fits[name] = {'early': early, 'late': late, 'models': models, 'limits':
+    fits[name] = {'early': early, 'late': late, 'models': models, 'mixing_cutoff_s': float(st.session_state[f'{uid}_mixing_cutoff']), 'limits':
                   {k: st.session_state.get(f'{uid}_{k}') for k in
                    ('early_start','early_end','late_start','late_end')}}
 
@@ -283,6 +316,7 @@ if plot_view == 'All time courses (grid)':
         cc += 1
         df = parsed[name]['df']
         plot_fit = fits[name]
+        grid.add_vrect(x0=0, x1=plot_fit['mixing_cutoff_s'], fillcolor='#AAAAAA', opacity=.09, line_width=0, row=rr, col=cc)
         grid.add_trace(go.Scatter(x=df.time_s, y=df.absorbance, mode='lines+markers',
                                   line=dict(color=GRAY, width=1.25), marker=dict(size=2),
                                   name='A340 data', legendgroup='data', showlegend=i == 0,
@@ -331,6 +365,7 @@ if plot_view == 'All time courses (grid)':
 else:
     selected = fits[current]
     fig = go.Figure()
+    fig.add_vrect(x0=0, x1=selected['mixing_cutoff_s'], fillcolor='#AAAAAA', opacity=.1, line_width=0)
     fig.add_trace(go.Scatter(x=curr_df.time_s,y=curr_df.absorbance, mode='lines+markers',
                              marker={'size':4}, line={'color':GRAY, 'width':1},
                              name='Measured A340'))
@@ -445,6 +480,12 @@ else:
                'five different positive pyruvate concentrations with valid positive velocities.')
 
 st.subheader('Results and downloads')
+st.caption('Apparent fraction columns describe A340 changes after the per-trace mixing cutoff, '
+           'expressed in NADH equivalents. They do not include consumption before the cutoff '
+           'and do not correct for changes in pyruvate or product absorbance. '
+           'A late phase beyond 10% is not automatically a failed fit. '
+           'High baseline absorbance at concentrated pyruvate warrants substrate-matched blanks, '
+           'but it is not automatically a failed measurement.')
 st.dataframe(summary,hide_index=True,use_container_width=True)
 
 csv_content=summary.to_csv(index=False).encode('utf-8-sig')
@@ -459,7 +500,9 @@ with col2:
                   'Pathlength (cm)':path_cm,
                   'Initial NADH (uM)':initial_nadh,
                   'Blank slope (A/s)':blank_slope,
-                  'Dead time excluded (s)':dead_time_s}
+                  'Mixing cutoff for selected trace (s)': selected['mixing_cutoff_s'],
+                  'Postmix apparent fraction to late end (NOT true NADH depletion)':
+                      float(summary.loc[summary['file']==current, 'apparent_fraction_to_late_end_postmix'].iloc[0])}
         pdf=make_pdf(current,curr_df,models,selected['early'],selected['late'],
                      trace_group,substrate_fits,settings)
         st.download_button('Download 3-page PDF report',pdf,
@@ -491,7 +534,7 @@ with pdf_extra2:
     pdf_show_segmented = st.checkbox('Include segmented fits in PDF', value=False)
 all_traces_pdf = make_all_traces_pdf(
     parsed, fits, summary,
-    settings={'Dead time excluded (s)': dead_time_s},
+    settings={'Mixing cutoff': 'per trace, listed in plots'},
     show_exponential=pdf_show_exponential,
     show_segmented=pdf_show_segmented,
 )
@@ -508,7 +551,9 @@ with st.expander('Scientific limitations and suggested controls'):
 - An exponential slope transition is phenomenological. Its **k_obs** is not automatically an adduct formation constant.
 - As NADH decreases and NAD⁺ builds up, the reaction environment changes; late-phase rates may be product- or substrate-dependent.
 - Mixing artifacts and the instrumental dead time can bias early slopes. Compare mixing-only controls and replicate traces.
-- Check the fraction of NADH consumed. If substantial, **neither late nor early slopes necessarily represent initial rates**.
+- The ~10% conversion rule is a guide for **initial-rate** measurements. It must not be used to discard the later time-course data needed to investigate time-dependent inhibition.
+- Displayed 'apparent NADH-equivalent changes' use post-mixing absorbance differences, not absolute A340. They are **not reliable measurements of NADH conversion** unless contributions from pyruvate and products are established.
+- High pyruvate concentration can increase the baseline A340 even if its molar absorptivity is much lower than NADH's. Check matched pyruvate blanks and the spectrophotometer's linear absorbance range. Changes in pyruvate absorbance during turnover can also influence the observed slope.
 - The software does not perform kinetic modeling of the complete ordered Bi–Bi reaction network or of covalent adduct formation.
 - When possible, repeat runs with varied initial NADH and independent mixing/control experiments.
 - Data are processed in the active Streamlit session and are not written to an app database. The user downloads results explicitly.

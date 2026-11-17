@@ -202,7 +202,27 @@ def fit_segmented(t: np.ndarray, a: np.ndarray, min_points_each: int = 6) -> dic
             'predicted_A': pred, **_metrics(a, pred, params=4)}
 
 
-def fit_all_models(df: pd.DataFrame, dead_time_s: float = 5.0) -> dict:
+def apparent_postmix_fraction(t: np.ndarray, absorbance: np.ndarray,
+                              start_s: float, end_s: float,
+                              extinction_mM: float, path_cm: float,
+                              initial_nadh_uM: float) -> float:
+    """Absorbance drop as an *apparent* NADH-equivalent fraction of input NADH.
+
+    This is NOT a quantitative NADH depletion estimate when pyruvate and
+    products contribute a changing A340 signal. Only use after mixing. The
+    amount consumed before the mixing cutoff is unknown.
+    """
+    t = np.asarray(t, float)
+    a = np.asarray(absorbance, float)
+    if not (len(t) >= 2 and t[0] <= start_s <= end_s <= t[-1]):
+        return float('nan')
+    if min(extinction_mM, path_cm, initial_nadh_uM) <= 0:
+        return float('nan')
+    drop_A = float(np.interp(start_s, t, a) - np.interp(end_s, t, a))
+    return max(0.0, drop_A * 1000 / (extinction_mM * path_cm * initial_nadh_uM))
+
+
+def fit_all_models(df: pd.DataFrame, dead_time_s: float = 15.0) -> dict:
     df = df[df.time_s >= dead_time_s]
     if len(df) < 13:
         raise DataError('Too few points after excluded mixing/dead-time period.')
@@ -251,21 +271,24 @@ def fit_substrate_inhibition(s: np.ndarray, v: np.ndarray) -> dict:
             **_metrics(v, pred, params=3)}
 
 
-def recommended_windows(t: np.ndarray) -> dict[str, float]:
-    """Reproducible defaults; these are proposals, never automatic mechanism calls."""
+def recommended_windows(t: np.ndarray, cutoff_s: float = 15.0) -> dict[str, float]:
+    """Propose early/late fitting windows AFTER a per-trace mixing cutoff.
+
+    They are starting points only. The user should inspect and edit each trace.
+    """
     t = np.asarray(t, float)
     lo, hi = float(np.min(t)), float(np.max(t))
-    duration = hi - lo
-    if duration < 1:
-        raise DataError('Trace shorter than one second.')
-    # Approx. 5–20 s and 30–60 s for a 60+ second trace; adapt to shorter runs.
-    start_early = max(lo + .05 * duration, 5.0) if hi >= 60 else lo + .05 * duration
-    end_early = min(20.0, lo + .36 * duration) if hi >= 60 else lo + .35 * duration
-    start_late = min(30.0, lo + .52 * duration) if hi >= 60 else lo + .55 * duration
-    end_late = min(60.0, hi) if hi >= 60 else lo + .95 * duration
     dt = float(np.median(np.diff(np.unique(t))))
-    if end_early - start_early < 4*dt or end_late - start_late < 4*dt:
-        start_early, end_early = lo + .08*duration, lo + .35*duration
-        start_late, end_late = lo + .55*duration, lo + .95*duration
-    return dict(early_start=float(start_early), early_end=float(end_early),
-                late_start=float(start_late), late_end=float(end_late))
+    after = max(lo, float(cutoff_s))
+    span = hi - after
+    if span < max(10*dt, 1.0):
+        raise DataError('Insufficient time points after the mixing cutoff to propose two windows.')
+    early_start = after
+    early_end = after + min(15.0, max(0.38*span, 5*dt))
+    late_start = after + min(25.0, max(0.55*span, early_end-after+2*dt))
+    late_end = after + min(55.0, max(0.95*span, late_start-after+5*dt))
+    early_end = min(early_end,hi)
+    late_start = min(late_start,hi)
+    late_end = min(late_end,hi)
+    return dict(early_start=float(early_start), early_end=float(early_end),
+                late_start=float(late_start), late_end=float(late_end))

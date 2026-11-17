@@ -26,6 +26,7 @@ def make_pdf(name: str, df: pd.DataFrame, fit_models: dict,
         tr = fit_models['transition']; tm = fit_models['t']
         ax.plot(tm, tr['predicted_A'], lw=1.8, ls='--', color='#009E73',
                 label='Smooth exponential transition')
+        ax.axvspan(0, float(settings.get('Mixing cutoff for selected trace (s)', 15)), color='#AAAAAA', alpha=.1)
         ax.set(xlabel='Time (s)', ylabel='Absorbance at 340 nm')
         ax.legend(loc='best'); ax.grid(alpha=.15)
         subtitle = (f"Early slope {early['slope_A_s']:.5g} A/s;  "
@@ -66,6 +67,8 @@ def make_pdf(name: str, df: pd.DataFrame, fit_models: dict,
         description += ['', 'Interpretation notes:',
                         '• The early and late slopes depend on selected time windows.',
                         '• A smooth transition is not proof of adduct formation.',
+                        '• The 10% rule applies to initial-rate interpretation, not exclusion of late phases.',
+                        '• Pyruvate/background absorbance complicates absolute A340 and depletion.',
                         '• NADH depletion, NAD+ accumulation, and mixing can alter progress curves.',
                         '• Apparent Km and Ki may vary with the fitting window and model.',
                         '• Confirm findings using controls and independent replicate assays.']
@@ -119,6 +122,8 @@ def make_all_traces_pdf(parsed: dict, fits: dict, summary: pd.DataFrame,
                 fit = fits.get(name, {})
                 t = df['time_s'].to_numpy(float)
                 y = df['absorbance'].to_numpy(float)
+                cutoff = float(fit.get('mixing_cutoff_s', 15.0))
+                ax.axvspan(0, cutoff, color='#AAAAAA', alpha=.12, linewidth=0)
                 ax.plot(t, y, color='#555555', linewidth=1.0, label='Measured A340',
                         marker='.', markersize=2.4)
                 for label, key, color in [('Early linear', 'early', '#0072B2'),
@@ -158,6 +163,7 @@ def make_all_traces_pdf(parsed: dict, fits: dict, summary: pd.DataFrame,
                         fig_text = 'Could not calculate both velocities'
                 except (TypeError, ValueError, KeyError):
                     fig_text = 'Could not calculate both velocities'
+                fig_text += f'  |  mixing cutoff {cutoff:g} s'
                 ax.text(.02, .03, fig_text, transform=ax.transAxes,
                         fontsize=8, ha='left', va='bottom',
                         bbox={'facecolor':'white','edgecolor':'none','alpha':.82,'pad':1.5})
@@ -168,10 +174,10 @@ def make_all_traces_pdf(parsed: dict, fits: dict, summary: pd.DataFrame,
             fig.legend(handles, labels, loc='upper center', ncol=min(5,len(labels)),
                        bbox_to_anchor=(.5, .919), frameon=False, fontsize=9)
             fig.text(.045, .038,
-                     'Descriptive fits only. Review warning flags and NADH depletion before interpreting rates.',
+                     'Descriptive fits only. Initial-rate criteria do not exclude later phases; examine postmix absorbance and pyruvate blanks.',
                      fontsize=8, color='#555555')
             fig.text(.965, .038,
-                     f'Exclusion before {settings.get("Dead time excluded (s)", "?")} s',
+                     'Mixing cutoff adjustable for each trace',
                      ha='right', fontsize=8, color='#555555')
             fig.subplots_adjust(left=.075, right=.975, top=.80, bottom=.10,
                                 wspace=.26, hspace=.42)
