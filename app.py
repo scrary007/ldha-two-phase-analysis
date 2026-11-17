@@ -21,7 +21,7 @@ from analysis import (
     fit_substrate_inhibition, read_cary_csv, recommended_windows,
     signal_slope_to_velocity, substrate_inhibition,
 )
-from report import make_pdf
+from report import make_pdf, make_all_traces_pdf
 
 
 st.set_page_config(page_title='LDHA | Biphasic time courses', layout='wide',
@@ -478,6 +478,29 @@ with col3:
         st.download_button('Download fitted time courses (CSV)',
                            pd.DataFrame(model_rows).to_csv(index=False).encode('utf-8-sig'),
                            file_name='LDHA_fitted_traces.csv',mime='text/csv')
+
+
+# Export a true PDF grid instead of relying on browser Print, which may clip
+# interactive Plotly rows. This includes all selected traces irrespective of
+# which on-screen view is active.
+st.markdown('**All time-course plots (PDF)**')
+pdf_extra1, pdf_extra2 = st.columns(2)
+with pdf_extra1:
+    pdf_show_exponential = st.checkbox('Include exponential fits in PDF', value=False)
+with pdf_extra2:
+    pdf_show_segmented = st.checkbox('Include segmented fits in PDF', value=False)
+all_traces_pdf = make_all_traces_pdf(
+    parsed, fits, summary,
+    settings={'Dead time excluded (s)': dead_time_s},
+    show_exponential=pdf_show_exponential,
+    show_segmented=pdf_show_segmented,
+)
+st.download_button('Download ALL time courses (PDF)', all_traces_pdf,
+                   file_name='LDHA_all_time_courses.pdf', mime='application/pdf',
+                   help='Printable landscape PDF: four time courses per page, in increasing pyruvate order.')
+st.caption('Includes every selected trace, with its early and late fitted lines. '
+           'Plots share a time axis but use separate absorbance scales. '
+           'The existing 3-page PDF report remains available above.')
 
 with st.expander('Scientific limitations and suggested controls'):
     st.markdown('''
