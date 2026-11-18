@@ -767,6 +767,11 @@ with col1:
                        file_name='LDHA_two_phase_velocities.csv',mime='text/csv')
 with col2:
     if models and selected['early'] and selected['late']:
+        # The selected trace's decision comes from the final merged summary.
+        # v1.7 mistakenly referred to an undefined current_approval variable.
+        current_approval = summary_accepted.loc[
+            summary_accepted['file'] == current
+        ].iloc[0]
         settings={'Selected trace':current,
                   'Extinction coefficient (mM^-1 cm^-1)':extinction,
                   'Pathlength (cm)':path_cm,
