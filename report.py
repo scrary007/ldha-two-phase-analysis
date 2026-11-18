@@ -8,9 +8,123 @@ import pandas as pd
 from analysis import substrate_inhibition, transition_signal
 
 
+
+def _primary_rows(accepted_summary: pd.DataFrame | None) -> pd.DataFrame:
+    """Only explicitly selected primary velocities; ignore unreviewed data."""
+    if accepted_summary is None or accepted_summary.empty:
+        return pd.DataFrame()
+    needed = {'primary_verified', 'accepted_v0_uM_s', 'pyruvate_mM', 'enzyme'}
+    if not needed.issubset(accepted_summary.columns):
+        return pd.DataFrame()
+    data = accepted_summary.copy()
+    selected = data['primary_verified'].fillna(False).astype(bool)
+    selected &= pd.to_numeric(data['accepted_v0_uM_s'], errors='coerce') > 0
+    selected &= pd.to_numeric(data['pyruvate_mM'], errors='coerce') > 0
+    return data.loc[selected].copy()
+
+
+def _plot_accepted_velocities(fig, ax, accepted_summary: pd.DataFrame | None,
+                              primary_fits: dict | None):
+    """A real fitted accepted-v0 vs pyruvate plot, not the early-window plot."""
+    primary_fits = primary_fits or {}
+    data = _primary_rows(accepted_summary)
+    if data.empty:
+        ax.axis('off')
+        ax.text(.5, .53, 'No time courses accepted for primary kinetic analysis.',
+                ha='center', va='center', fontsize=13, transform=ax.transAxes)
+        ax.text(.5, .44, 'Accept suitable velocities to generate this fit.',
+                ha='center', va='center', fontsize=10, transform=ax.transAxes)
+        return
+    palette = ['#0072B2', '#D55E00', '#009E73', '#CC79A7', '#555555']
+    symbols = ['o', 's', 'D', '^', 'v']
+    for idx, (enzyme, group) in enumerate(sorted(data.groupby('enzyme'), key=lambda x: str(x[0]))):
+        c = palette[idx % len(palette)]
+        group = group.sort_values('pyruvate_mM')
+        ax.scatter(group.pyruvate_mM, group.accepted_v0_uM_s, s=42,
+                   marker=symbols[idx % len(symbols)], color=c,
+                   label=f'{enzyme}: accepted v0', zorder=3)
+        ft = primary_fits.get(enzyme)
+        if ft:
+            xx = np.linspace(0, float(group.pyruvate_mM.max()), 450)
+            ax.plot(xx, substrate_inhibition(xx, ft['vmax_uM_s'],
+                    ft['km_mM'], ft['ki_mM']), color=c, lw=2.2,
+                    label=f'{enzyme}: accepted-v0 fit')
+    ax.set(xlabel='[Pyruvate] (mM)', ylabel='Accepted initial velocity (µM/s)')
+    ax.grid(alpha=.16)
+    ax.legend(loc='best', fontsize=9)
+
+
+def _combined_parameter_rows(primary_fits: dict | None,
+                             substrate_fits: dict | None,
+                             selected_enzyme: str | None):
+    """One comparative table: accepted fit plus both exploratory window fits."""
+    primary_fits = primary_fits or {}
+    substrate_fits = substrate_fits or {}
+    rows = []
+    enzymes = sorted(set(primary_fits) | ({str(selected_enzyme)} if selected_enzyme else set()))
+    if not enzymes:
+        enzymes = ['WT']
+    for enzyme in enzymes:
+        ft = primary_fits.get(enzyme)
+        rows.append((enzyme, 'Accepted v0 (primary)', ft))
+    for key, label in (('v_early_uM_s', 'Early window (exploratory)'),
+                       ('v_late_uM_s', 'Late window (exploratory)')):
+        rows.append((str(selected_enzyme or enzymes[0]), label, substrate_fits.get(key)))
+    return rows
+
+
+def _draw_combined_parameter_table(ax, primary_fits: dict | None,
+                                   substrate_fits: dict | None,
+                                   selected_enzyme: str | None,
+                                   *, bbox=(.025, .64, .95, .25)):
+    rows = _combined_parameter_rows(primary_fits, substrate_fits, selected_enzyme)
+    cell_rows = []
+    warnings = []
+    def fmt(ft, key, n=4):
+        val = ft.get(key, float('nan'))
+        try:
+            val = float(val)
+            return f'{val:.{n}g}' if np.isfinite(val) else '—'
+        except (TypeError, ValueError):
+            return '—'
+    for enzyme, label, ft in rows:
+        if ft:
+            cell_rows.append([str(enzyme)[:14], label, fmt(ft,'enzyme_concentration_nM',5),
+                              fmt(ft,'vmax_uM_s',5), fmt(ft,'kcat_s_1',5),
+                              fmt(ft,'km_mM',5), fmt(ft,'ki_mM',5),
+                              fmt(ft,'r2',4), str(ft.get('n',''))])
+            if ft.get('warning'):
+                warnings.append(f'{enzyme} {label}: {ft["warning"]}')
+        else:
+            cell_rows.append([str(enzyme)[:14], label, '—', 'Not fitted', '—', '—', '—', '—', '—'])
+    col_names = ['Enzyme','Analysis','[E] nM','Vmax µM/s','kcat s^-1',
+                 'KM mM','KI mM','R²','n']
+    x,y,w,h=bbox
+    # More rows need additional table height; use available space at the top.
+    height=max(h, min(.48, .084 + .045 * len(cell_rows)))
+    tab = ax.table(cellText=cell_rows, colLabels=col_names,
+                   colWidths=[.105,.225,.075,.11,.11,.10,.10,.085,.055],
+                   loc='upper center', bbox=[x, y+h-height, w, height],
+                   cellLoc='center', colLoc='center')
+    tab.auto_set_font_size(False)
+    tab.set_fontsize(8.25 if len(cell_rows)<8 else 7.2)
+    for (i,j), cell in tab.get_celld().items():
+        cell.set_edgecolor('#D8DEE2')
+        if i == 0:
+            cell.set_facecolor('#E6EFF5'); cell.set_text_props(weight='bold')
+        elif i == 1:
+            cell.set_facecolor('#EAF5F1')
+        elif i % 2 == 0:
+            cell.set_facecolor('#F7FAFC')
+    return warnings
+
+
 def make_pdf(name: str, df: pd.DataFrame, fit_models: dict,
              early: dict, late: dict, table: pd.DataFrame,
-             substrate_fits: dict, settings: dict) -> bytes:
+             substrate_fits: dict, settings: dict,
+             accepted_summary: pd.DataFrame | None = None,
+             primary_fits: dict | None = None,
+             selected_enzyme: str | None = None) -> bytes:
     output = BytesIO()
     t, a = df['time_s'].to_numpy(), df['absorbance'].to_numpy()
     with PdfPages(output) as pdf:
@@ -61,44 +175,30 @@ def make_pdf(name: str, df: pd.DataFrame, fit_models: dict,
         fig.text(.08, .026, 'Exploratory: two slopes do not establish the adduct mechanism.', fontsize=9)
         pdf.savefig(fig); plt.close(fig)
 
+        # Primary accepted rates are a distinct analysis from the early/late exploratory curves.
+        fig, ax = plt.subplots(figsize=(10.5, 7.6))
+        fig.suptitle('Accepted initial-velocity substrate-inhibition fit (PRIMARY)',
+                     fontsize=14, weight='bold')
+        _plot_accepted_velocities(fig, ax, accepted_summary, primary_fits)
+        fig.text(.08, .05, 'Uses only velocities explicitly accepted for primary kinetic analysis.', fontsize=9)
+        fig.text(.08, .025, 'The fitted starting velocity after mixing is not necessarily the true t = 0 rate.', fontsize=9)
+        fig.subplots_adjust(left=.12, right=.94, top=.88, bottom=.15)
+        pdf.savefig(fig); plt.close(fig)
+
         fig, ax = plt.subplots(figsize=(10.5, 7.6)); ax.axis('off')
-        fig.suptitle('Analysis settings and fitted kinetic parameters', fontsize=15, weight='bold')
-        # These fits describe the EARLY and LATE linear windows, respectively;
-        # they do not combine with the separate accepted-initial-velocity dataset.
-        phase_names = [('v_early_uM_s', 'Early window'),
-                       ('v_late_uM_s', 'Late window')]
-        param_rows = []
-        for phase_key, phase_label in phase_names:
-            ft = substrate_fits.get(phase_key)
-            if ft:
-                param_rows.append([phase_label,
-                                   f"{ft.get('enzyme_concentration_nM', float('nan')):.5g}",
-                                   f"{ft['vmax_uM_s']:.4g}",
-                                   f"{ft.get('kcat_s_1', float('nan')):.5g}",
-                                   f"{ft['km_mM']:.4g}",
-                                   f"{ft['ki_mM']:.4g}",
-                                   f"{ft.get('r2', float('nan')):.4g}",
-                                   str(ft.get('n', ''))])
-            else:
-                param_rows.append([phase_label, '—', 'Not fit', '—', '—', '—', '—', '—'])
-        header = ['Phase', '[E] (nM)', 'Vmax (µM/s)', 'kcat (s^-1)', 'KM (mM)', 'KI (mM)', 'R²', 'n']
-        tab = ax.table(cellText=param_rows, colLabels=header, cellLoc='center',
-                       colLoc='center', loc='upper center', bbox=[.03, .72, .94, .13],
-                       colWidths=[.19,.10,.15,.13,.12,.12,.10,.09])
-        tab.auto_set_font_size(False); tab.set_fontsize(8.8)
-        for (i,j), cell in tab.get_celld().items():
-            cell.set_edgecolor('#D8DEE2')
-            if i == 0: cell.set_facecolor('#EBF1F5'); cell.set_text_props(weight='bold')
-        ax.text(.06, .68, 'Descriptive apparent parameters: v = Vmax[S] / (KM + [S] + [S]²/KI).',
+        fig.suptitle('All kinetic parameters | ONE comparison table', fontsize=15, weight='bold')
+        warning_list = _draw_combined_parameter_table(
+            ax, primary_fits, substrate_fits, selected_enzyme,
+            bbox=(.035, .73, .93, .165))
+        ax.text(.06, .645, 'Green = PRIMARY: researcher-accepted v0; other rows use exploratory early/late windows.',
                 transform=ax.transAxes, fontsize=9)
-        ax.text(.06, .645, 'kcat = 1000 x Vmax (µM/s) / [E] active sites (nM); no parameter errors are estimated.',
-                transform=ax.transAxes, fontsize=8.6)
-        warnings = [f"{label}: {substrate_fits[key].get('warning')}"
-                    for key,label in phase_names
-                    if key in substrate_fits and substrate_fits[key].get('warning')]
-        if warnings:
-            ax.text(.06, .608, 'Warnings: ' + ' | '.join(warnings)[:145],
-                    transform=ax.transAxes, fontsize=8, color='#A33D2B')
+        ax.text(.06, .613, 'Model: v = Vmax[S] / (KM + [S] + [S]²/KI). All kinetic parameters are apparent.',
+                transform=ax.transAxes, fontsize=9)
+        ax.text(.06, .581, 'kcat = 1000 × Vmax (µM/s) / [E] active-site (nM). No parameter uncertainties estimated.',
+                transform=ax.transAxes, fontsize=9)
+        if warning_list:
+            ax.text(.06, .55, 'Fit warnings: ' + ' | '.join(warning_list)[:145],
+                    transform=ax.transAxes, fontsize=7.8, color='#A33D2B')
         description = [f'{k}: {v}' for k,v in settings.items()]
         description += ['', 'Interpretation notes:',
                         '• The early and late slopes depend on selected time windows.',
@@ -108,7 +208,7 @@ def make_pdf(name: str, df: pd.DataFrame, fit_models: dict,
                         '• NADH depletion, NAD+ accumulation, and mixing can alter progress curves.',
                         '• Apparent Km and Ki may vary with the fitting window and model.',
                         '• Confirm findings using controls and independent replicate assays.']
-        ax.text(.06,.555,'\n'.join(description), va='top', fontsize=9.2,
+        ax.text(.06,.500,'\n'.join(description), va='top', fontsize=9.2,
                 family='DejaVu Sans', linespacing=1.45, transform=ax.transAxes)
         pdf.savefig(fig); plt.close(fig)
     return output.getvalue()
@@ -226,7 +326,9 @@ def make_all_traces_pdf(parsed: dict, fits: dict, summary: pd.DataFrame,
 
 
 def make_acceptance_pdf(summary: pd.DataFrame, primary_fits: dict,
-                        settings: dict | None = None) -> bytes:
+                        settings: dict | None = None,
+                        substrate_fits: dict | None = None,
+                        selected_enzyme: str | None = None) -> bytes:
     """Export explicit decisions for every trace and the selected primary v0 curves.
 
     Separate from the legacy 3-page exploratory report. PDF output preserves
@@ -319,47 +421,31 @@ def make_acceptance_pdf(summary: pd.DataFrame, primary_fits: dict,
         fig.subplots_adjust(left=.12, right=.95, top=.88, bottom=.17)
         pdf.savefig(fig); plt.close(fig)
 
-        # Report parameter estimates independently for each enzyme/variant.
-        # No fit can be calculated with fewer than five distinct substrate concentrations.
+        # Unified table: accepted primary and exploratory early/late fits.
         fig, ax = plt.subplots(figsize=(11, 8.5)); ax.axis('off')
-        fig.suptitle('LDHA | Accepted v0 kinetic parameters', fontsize=16,
-                     fontweight='bold', y=.96)
-        rows = []
-        for enzyme_name, ft in sorted(primary_fits.items()):
-            rows.append([str(enzyme_name)[:22],
-                         f"{ft.get('enzyme_concentration_nM', float('nan')):.5g}",
-                         f"{ft['vmax_uM_s']:.5g}",
-                         f"{ft.get('kcat_s_1', float('nan')):.5g}",
-                         f"{ft['km_mM']:.5g}",
-                         f"{ft['ki_mM']:.5g}",
-                         f"{ft.get('r2', float('nan')):.4g}",
-                         str(ft.get('n', ''))])
-        if rows:
-            hdr = ['Enzyme', '[E] nM', 'Vmax µM/s', 'kcat s^-1', 'KM mM', 'KI mM', 'R²', 'n']
-            tab = ax.table(cellText=rows, colLabels=hdr, cellLoc='center',
-                           colLoc='center', colWidths=[.24,.105,.14,.14,.125,.125,.07,.055],
-                           loc='upper center', bbox=[.05, max(.30, .82-.055*len(rows)), .90,
-                                                     min(.45, .075+.055*len(rows))])
-            tab.auto_set_font_size(False); tab.set_fontsize(8.4)
-            for (i,j), cell in tab.get_celld().items():
-                cell.set_edgecolor('#D8DEE2')
-                if i == 0: cell.set_facecolor('#EBF1F5'); cell.set_text_props(weight='bold')
-            warnings = [f"{enzyme_name}: {ft.get('warning')}" for enzyme_name,ft in sorted(primary_fits.items())
-                        if ft.get('warning')]
-            if warnings:
-                ax.text(.06, .25, 'Fit warnings: ' + '; '.join(warnings)[:180],
-                        transform=ax.transAxes, fontsize=9, color='#A33D2B', wrap=True)
-        else:
-            ax.text(.06, .74, 'No primary substrate-inhibition fit available. At least five distinct',
-                    transform=ax.transAxes, fontsize=11)
-            ax.text(.06, .70, 'positive concentrations with accepted initial velocities are required.',
-                    transform=ax.transAxes, fontsize=11)
-        ax.text(.06,.15,'Model: v = Vmax[S] / (KM + [S] + [S]²/KI)', fontsize=10,
-                transform=ax.transAxes)
-        ax.text(.06,.11,'kcat = 1000 × Vmax (µM/s) / final active-site [E] (nM). Values are apparent.',
+        fig.suptitle('LDHA | All fitted kinetic parameters (comparison)',
+                     fontsize=16, fontweight='bold', y=.96)
+        fit_warnings = _draw_combined_parameter_table(
+            ax, primary_fits, substrate_fits, selected_enzyme,
+            bbox=(.035, .65, .93, .20))
+        ax.text(.055, .60, 'PRIMARY accepted-v0 fit is highlighted. Early/late windows are exploratory comparisons.',
+                fontsize=9.5, transform=ax.transAxes)
+        ax.text(.055, .56, 'For multiple enzymes, early/late exploratory rows refer to the selected enzyme.',
                 fontsize=9, transform=ax.transAxes)
-        ax.text(.06,.075,'Fit uncertainties are not estimated by the current fitting routine.',
+        ax.text(.055, .48, 'Model: v = Vmax[S] / (KM + [S] + [S]²/KI)',
+                fontsize=10, transform=ax.transAxes)
+        ax.text(.055, .44, 'kcat = 1000 × Vmax (µM/s) / [E] active-site (nM). Values are apparent.',
                 fontsize=9, transform=ax.transAxes)
+        ax.text(.055, .40, 'At least five distinct positive substrate concentrations are required for a fit.',
+                fontsize=9, transform=ax.transAxes)
+        ax.text(.055, .36, 'An accepted post-mixing rate may already reflect inhibition during the mixing period.',
+                fontsize=9, transform=ax.transAxes)
+        ax.text(.055, .32, 'Fit uncertainties are not estimated by the current fitting routine.',
+                fontsize=9, transform=ax.transAxes)
+        if fit_warnings:
+            from textwrap import wrap as _wrap
+            for i, line in enumerate(_wrap('Fit warnings: ' + '; '.join(fit_warnings), 110)[:3]):
+                ax.text(.055, .24-i*.035, line, fontsize=8, color='#A33D2B', transform=ax.transAxes)
         pdf.savefig(fig); plt.close(fig)
 
         # Preserve full reviewer notes and cautions, not just truncated table cells.

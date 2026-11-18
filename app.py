@@ -713,7 +713,6 @@ if not primary.empty:
     st.plotly_chart(primary_fig, use_container_width=True)
 
 st.subheader('Velocities versus [pyruvate]')
-st.markdown('**Primary kinetic parameter summary — accepted initial velocities**')
 primary_parameter_rows = []
 for enzyme_label, ft in sorted(primary_fits.items()):
     primary_parameter_rows.append({
@@ -721,17 +720,13 @@ for enzyme_label, ft in sorted(primary_fits.items()):
         'Vmax (μM/s)': ft['vmax_uM_s'], 'kcat (s⁻¹)': ft['kcat_s_1'],
         'KM (mM)': ft['km_mM'], 'KI (mM)': ft['ki_mM'],
         'R²': ft['r2'], 'n': ft['n'], 'Warning': ft.get('warning', '')})
-if primary_parameter_rows:
-    st.dataframe(pd.DataFrame(primary_parameter_rows), hide_index=True,
-                 use_container_width=True)
-else:
-    st.info('No primary kcat, KM or KI fit yet. Select suitable velocities across '
-            'at least five distinct pyruvate concentrations, including high concentrations '
-            'that constrain substrate inhibition. Review the selected method for each trace.')
-st.caption('kcat = Vmax / [E]active-sites. The fitted KM and KI do not depend on '
-           'the enzyme concentration entry. All values are apparent, based on selected '
-           'post-mixing velocities; any inhibitory transition during mixing is unobserved. '
-           'This fitting routine does not provide parameter uncertainties.')
+if not primary_parameter_rows:
+    st.info('No PRIMARY kcat, KM or KI fit yet. Select suitable velocities at '
+            'at least five distinct positive pyruvate concentrations; keep '
+            'high-substrate points to constrain KI.')
+st.caption('The PRIMARY fit uses only researcher-accepted rates. '
+           'All parameter sets will be compared together in a single table below. '
+           'An exponential starting velocity is estimated after mixing, not at t = 0.')
 
 if summary['enzyme'].nunique() > 1:
     enzymes = sorted(summary['enzyme'].unique())
@@ -778,24 +773,9 @@ ratio_fig.update_layout(xaxis_title='[Pyruvate] (mM)',yaxis_title='Late velocity
                         height=280,margin=dict(l=30,r=25,t=15,b=30))
 st.plotly_chart(ratio_fig,use_container_width=True)
 
-if substrate_fits:
-    st.markdown('**Substrate-inhibition fits (separate apparent parameter sets)**')
-    rows=[]
-    for phase, fit in substrate_fits.items():
-        rows.append({'Phase':phase.replace('v_','').replace('_uM_s',''),
-                     '[E] (nM)':fit['enzyme_concentration_nM'],
-                     'Vmax (μM/s)':fit['vmax_uM_s'],
-                     'kcat (s⁻¹)':fit['kcat_s_1'],
-                     'KM (mM)':fit['km_mM'],
-                     'KI (mM)':fit['ki_mM'],
-                     'R²':fit['r2'], 'Caution':fit['warning']})
-    st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-    st.caption('Model: v = Vmax[S] / (KM + [S] + [S]²/KI). '
-               'Because time-dependent phases need not be steady state, Vmax, KM, and KI '
-               'here are descriptive *apparent* parameters, not necessarily microscopic constants.')
-else:
-    st.caption('To fit early- and late-phase substrate-inhibition curves, provide at least '
-               'five different positive pyruvate concentrations with valid positive velocities.')
+if not substrate_fits:
+    st.caption('Exploratory early/late fits need at least five distinct positive '
+               'pyruvate concentrations with valid velocities.')
 
 kinetic_parameter_rows = [dict(Analysis='Primary accepted initial rates', **row)
                           for row in primary_parameter_rows]
@@ -808,6 +788,15 @@ for phase, ft in substrate_fits.items():
         'R²': ft['r2'], 'n': ft['n'], 'Warning': ft.get('warning', '')})
 
 st.subheader('Results and downloads')
+st.markdown('**All substrate-inhibition parameter fits — one comparison table**')
+if kinetic_parameter_rows:
+    st.dataframe(pd.DataFrame(kinetic_parameter_rows), hide_index=True,
+                 use_container_width=True)
+    st.caption('Primary accepted v0 = main kinetic analysis. Early and late windows = '
+               'exploratory comparisons. kcat uses the entered final active-site [E]. '
+               'Fits give apparent parameters, not uncertainties.')
+else:
+    st.info('No substrate-inhibition parameter fits are available yet.')
 if kinetic_parameter_rows:
     st.download_button('Download fitted kinetic parameters (CSV)',
         pd.DataFrame(kinetic_parameter_rows).to_csv(index=False).encode('utf-8-sig'),
@@ -852,8 +841,11 @@ with col2:
                   'Postmix apparent fraction to late end (NOT true NADH depletion)':
                       float(summary.loc[summary['file']==current, 'apparent_fraction_to_late_end_postmix'].iloc[0])}
         pdf=make_pdf(current,curr_df,models,selected['early'],selected['late'],
-                     trace_group,substrate_fits,settings)
-        st.download_button('Download 3-page PDF report',pdf,
+                     trace_group,substrate_fits,settings,
+                     accepted_summary=summary_accepted,
+                     primary_fits=primary_fits,
+                     selected_enzyme=target_enzyme)
+        st.download_button('Download combined kinetics report (PDF)',pdf,
                            file_name='LDHA_two_phase_report.pdf',mime='application/pdf')
 with col3:
     model_rows=[]
@@ -891,7 +883,7 @@ st.download_button('Download ALL time courses (PDF)', all_traces_pdf,
                    help='Printable landscape PDF: four time courses per page, in increasing pyruvate order.')
 st.caption('Includes every selected trace, with its early and late fitted lines. '
            'Plots share a time axis but use separate absorbance scales. '
-           'The existing 3-page PDF report remains available above.')
+           'The combined kinetics PDF above also contains the accepted-v0 curve and one parameter table.')
 
 st.markdown('**Download accepted analysis results**')
 ac1, ac2 = st.columns(2)
@@ -907,10 +899,12 @@ with ac2:
                                                 'Extinction coefficient (mM^-1 cm^-1)':extinction,
                                                 'Pathlength (cm)':path_cm,
                                                 'Blank slope (A/s)':blank_slope,
-                                                'Final active-site [E] by enzyme (nM)': str(enzyme_concentrations_nM)})
+                                                'Final active-site [E] by enzyme (nM)': str(enzyme_concentrations_nM)},
+                                      substrate_fits=substrate_fits,
+                                      selected_enzyme=target_enzyme)
     st.download_button('Download accepted-analysis report (PDF)', accepted_pdf,
                        file_name='LDHA_accepted_analysis.pdf', mime='application/pdf',
-                       help='All files, selected analysis methods, review notes and primary v0 fits.')
+                       help='Detailed decision record, accepted-v0 fit, and one combined kinetic parameter table.')
 
 with st.expander('Interpretation notes — what to do next', expanded=True):
     st.markdown('''
