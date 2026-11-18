@@ -33,8 +33,9 @@ st.set_page_config(page_title='LDHA | Biphasic time courses', layout='wide',
                    page_icon='🧪')
 BLUE, ORANGE, GREEN, PURPLE, GRAY = '#0072B2','#D55E00','#009E73','#CC79A7','#4A4A4A'
 
-st.title('LDHA · two-phase time-course analyzer')
-st.caption('Exploratory fitting of NADH absorbance time courses at 340 nm')
+st.title('LDHA · kinetics and two-phase time-course analyzer')
+st.caption('Primary goal: estimate apparent kcat, KM and KI from selected initial velocities; '
+           'investigate time-dependent changes as a separate diagnostic.')
 st.info('This app describes early and late reaction rates. A two-phase trace **does not by itself** '
         'establish formation of a pyruvate–NAD⁺ adduct. Compare independent experiments '
         'and rule out mixing, NADH depletion, and product accumulation.')
@@ -130,6 +131,28 @@ selected_rows = metadata[metadata['Include'].fillna(False)].copy()
 if selected_rows.empty:
     st.warning('Select at least one trace to fit.')
     st.stop()
+
+st.subheader('Final enzyme concentration for kcat')
+st.caption('Enter the FINAL LDHA catalytic active-site concentration in each assay, '
+           'not the working-stock concentration. The default is 0.667 nM (editable). '
+           'If the concentration was determined for tetrameric LDHA molecules, '
+           'convert to catalytic-site concentration before entering it (four sites per fully active tetramer).')
+enzyme_concentrations_nM = {}
+for enzyme_label in sorted(selected_rows['Enzyme'].astype(str).unique()):
+    enzyme_uid = sha1(enzyme_label.encode('utf-8')).hexdigest()[:12]
+    enzyme_concentrations_nM[enzyme_label] = st.number_input(
+        f'Final active-site [LDHA] for {enzyme_label} (nM)',
+        min_value=0.000001, value=0.667, step=0.001, format='%.5f',
+        key=f'enzyme_sites_nM_v18_{enzyme_uid}',
+        help='This value is used ONLY to convert fitted Vmax to kcat. '
+             'It does not change the A340 slopes, substrate-inhibition fit, KM or KI.')
+
+
+def annotate_kcat(fit, enzyme_label):
+    """Attach enzyme concentration and turnover number to an inhibition fit."""
+    e_nM = float(enzyme_concentrations_nM[str(enzyme_label)])
+    return {**fit, 'enzyme_concentration_nM': e_nM,
+            'kcat_s_1': 1000.0 * float(fit['vmax_uM_s']) / e_nM}
 
 st.subheader('Choose the early and late linear regions')
 names = selected_rows['Filename'].tolist()
@@ -619,6 +642,8 @@ for name in names:
 
 fingerprints = {name: analysis_signature(name) for name in names}
 summary_accepted = apply_approvals(summary, approvals, fingerprints)
+summary_accepted['enzyme_concentration_nM'] = (
+    summary_accepted['enzyme'].astype(str).map(enzyme_concentrations_nM))
 review_counts = pd.Series([r['decision'] for r in review_summary_rows]).value_counts()
 st.caption(f"Decisions: {int(review_counts.get(KINETIC, 0))} kinetic · "
            f"{int(review_counts.get(DESCRIPTIVE, 0))} descriptive · "
@@ -655,9 +680,9 @@ if not primary.empty:
     # even when only one enzyme is displayed on screen.
     for enzyme_name, enzyme_rows in primary.groupby('enzyme'):
         try:
-            primary_fits[enzyme_name] = fit_substrate_inhibition(
+            primary_fits[enzyme_name] = annotate_kcat(fit_substrate_inhibition(
                 enzyme_rows.pyruvate_mM.to_numpy(float),
-                enzyme_rows.accepted_v0_uM_s.to_numpy(float))
+                enzyme_rows.accepted_v0_uM_s.to_numpy(float)), enzyme_name)
         except DataError:
             pass
     primary_group = primary[primary.enzyme == primary_enzyme]
@@ -675,8 +700,10 @@ if not primary.empty:
                            y=substrate_inhibition(x, ft['vmax_uM_s'], ft['km_mM'], ft['ki_mM']),
                            name='Accepted-v₀ substrate-inhibition fit',mode='lines',
                            line=dict(color=BLUE, width=2)))
-        st.markdown(f"**Descriptive accepted-v₀ fit:** Vmax = {ft['vmax_uM_s']:.4g} μM/s; "
-                    f"KM = {ft['km_mM']:.4g} mM; KI = {ft['ki_mM']:.4g} mM. "
+        st.markdown(f"**Primary apparent kinetic parameters:** kcat = {ft['kcat_s_1']:.4g} s⁻¹; "
+                    f"KM = {ft['km_mM']:.4g} mM; KI = {ft['ki_mM']:.4g} mM; "
+                    f"Vmax = {ft['vmax_uM_s']:.4g} μM/s "
+                    f"using [E] = {ft['enzyme_concentration_nM']:.5g} nM. "
                     f"{ft.get('warning', '')}")
     else:
         st.caption('At least five distinct positive concentrations selected for kinetic analysis '
@@ -686,6 +713,26 @@ if not primary.empty:
     st.plotly_chart(primary_fig, use_container_width=True)
 
 st.subheader('Velocities versus [pyruvate]')
+st.markdown('**Primary kinetic parameter summary — accepted initial velocities**')
+primary_parameter_rows = []
+for enzyme_label, ft in sorted(primary_fits.items()):
+    primary_parameter_rows.append({
+        'Enzyme': enzyme_label, '[E] active sites (nM)': ft['enzyme_concentration_nM'],
+        'Vmax (μM/s)': ft['vmax_uM_s'], 'kcat (s⁻¹)': ft['kcat_s_1'],
+        'KM (mM)': ft['km_mM'], 'KI (mM)': ft['ki_mM'],
+        'R²': ft['r2'], 'n': ft['n'], 'Warning': ft.get('warning', '')})
+if primary_parameter_rows:
+    st.dataframe(pd.DataFrame(primary_parameter_rows), hide_index=True,
+                 use_container_width=True)
+else:
+    st.info('No primary kcat, KM or KI fit yet. Select suitable velocities across '
+            'at least five distinct pyruvate concentrations, including high concentrations '
+            'that constrain substrate inhibition. Review the selected method for each trace.')
+st.caption('kcat = Vmax / [E]active-sites. The fitted KM and KI do not depend on '
+           'the enzyme concentration entry. All values are apparent, based on selected '
+           'post-mixing velocities; any inhibitory transition during mixing is unobserved. '
+           'This fitting routine does not provide parameter uncertainties.')
+
 if summary['enzyme'].nunique() > 1:
     enzymes = sorted(summary['enzyme'].unique())
     target_enzyme = st.selectbox('Show enzyme/variant', enzymes)
@@ -707,7 +754,7 @@ for phase,col,color,label in [('v_early_uM_s','early_se_uM_s',BLUE,'Early-window
         try:
             fit=fit_substrate_inhibition(trace_group.pyruvate_mM.to_numpy(float),
                                         trace_group[phase].to_numpy(float))
-            substrate_fits[phase]=fit
+            substrate_fits[phase]=annotate_kcat(fit, target_enzyme)
             smax=float(trace_group.pyruvate_mM.max())
             curve=np.linspace(0,smax,350)
             kinetics_fig.add_trace(go.Scatter(x=curve,
@@ -736,7 +783,9 @@ if substrate_fits:
     rows=[]
     for phase, fit in substrate_fits.items():
         rows.append({'Phase':phase.replace('v_','').replace('_uM_s',''),
+                     '[E] (nM)':fit['enzyme_concentration_nM'],
                      'Vmax (μM/s)':fit['vmax_uM_s'],
+                     'kcat (s⁻¹)':fit['kcat_s_1'],
                      'KM (mM)':fit['km_mM'],
                      'KI (mM)':fit['ki_mM'],
                      'R²':fit['r2'], 'Caution':fit['warning']})
@@ -748,7 +797,23 @@ else:
     st.caption('To fit early- and late-phase substrate-inhibition curves, provide at least '
                'five different positive pyruvate concentrations with valid positive velocities.')
 
+kinetic_parameter_rows = [dict(Analysis='Primary accepted initial rates', **row)
+                          for row in primary_parameter_rows]
+for phase, ft in substrate_fits.items():
+    kinetic_parameter_rows.append({
+        'Analysis': 'Exploratory ' + ('early linear window' if phase == 'v_early_uM_s' else 'late linear window'),
+        'Enzyme': target_enzyme, '[E] active sites (nM)': ft['enzyme_concentration_nM'],
+        'Vmax (μM/s)': ft['vmax_uM_s'], 'kcat (s⁻¹)': ft['kcat_s_1'],
+        'KM (mM)': ft['km_mM'], 'KI (mM)': ft['ki_mM'],
+        'R²': ft['r2'], 'n': ft['n'], 'Warning': ft.get('warning', '')})
+
 st.subheader('Results and downloads')
+if kinetic_parameter_rows:
+    st.download_button('Download fitted kinetic parameters (CSV)',
+        pd.DataFrame(kinetic_parameter_rows).to_csv(index=False).encode('utf-8-sig'),
+        file_name='LDHA_kcat_KM_KI_parameters.csv', mime='text/csv',
+        help='Primary accepted rates and exploratory early/late window parameters; '
+             'each row states the active-site concentration used to calculate kcat.')
 st.caption('Apparent fraction columns describe A340 changes after the per-trace mixing cutoff, '
            'expressed in NADH equivalents. They do not include consumption before the cutoff '
            'and do not correct for changes in pyruvate or product absorbance. '
@@ -776,6 +841,7 @@ with col2:
                   'Extinction coefficient (mM^-1 cm^-1)':extinction,
                   'Pathlength (cm)':path_cm,
                   'Initial NADH (uM)':initial_nadh,
+                  'Final active-site LDHA concentration (nM)': enzyme_concentrations_nM[str(target_enzyme)],
                   'Blank slope (A/s)':blank_slope,
                   'Mixing cutoff for selected trace (s)': selected['mixing_cutoff_s'],
                   'Accepted status': current_approval['acceptance_status'],
@@ -840,7 +906,8 @@ with ac2:
                                       settings={'Initial NADH (uM)':initial_nadh,
                                                 'Extinction coefficient (mM^-1 cm^-1)':extinction,
                                                 'Pathlength (cm)':path_cm,
-                                                'Blank slope (A/s)':blank_slope})
+                                                'Blank slope (A/s)':blank_slope,
+                                                'Final active-site [E] by enzyme (nM)': str(enzyme_concentrations_nM)})
     st.download_button('Download accepted-analysis report (PDF)', accepted_pdf,
                        file_name='LDHA_accepted_analysis.pdf', mime='application/pdf',
                        help='All files, selected analysis methods, review notes and primary v0 fits.')
@@ -863,6 +930,12 @@ with st.expander('Interpretation notes — what to do next', expanded=True):
 - **Analysis in this app:** The default is a provisional **Early window** and the bulk recommendation is **Descriptive only**. You may override the method or exclude the trace. Do not accept k_obs. Check mixing and residuals first. If the transition is potentially **faster** than the mixing cutoff, use faster mixing/acquisition; if potentially **slower** than the observation period, collect longer traces with appropriate depletion controls. Repeat under matched conditions. The boundary direction, when available, is listed in the results table.
 
 These three automated outcomes use **exploratory thresholds**: ≥10 AICc units of improvement over a straight line **and** ≥10% modeled change in slope. They are not formal hypothesis tests; closely spaced measurements may have correlated noise. A visible change in slope is not proof of the inhibition mechanism.
+
+**Primary research objective: apparent kcat, KM and KI**
+
+- Select the most defensible early post-mixing velocity for each pyruvate concentration, including high-[pyruvate] points needed to estimate KI. The time-dependent fit helps decide which velocity estimate is credible; it is not the ultimate endpoint.
+- Enter the final **active-site** enzyme concentration for each variant above. The program calculates **kcat (s⁻¹) = 1000 × Vmax (µM/s) / [E] (nM)**. Changing [E] changes kcat but not Vmax, KM or KI.
+- If the first observable velocity is already inhibited because the transition occurs during mixing, the fitted parameter values describe the observed post-mixing regime, not necessarily the uninhibited initial state.
 
 **Additional limitations and controls**
 

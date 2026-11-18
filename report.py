@@ -72,24 +72,26 @@ def make_pdf(name: str, df: pd.DataFrame, fit_models: dict,
             ft = substrate_fits.get(phase_key)
             if ft:
                 param_rows.append([phase_label,
+                                   f"{ft.get('enzyme_concentration_nM', float('nan')):.5g}",
                                    f"{ft['vmax_uM_s']:.4g}",
+                                   f"{ft.get('kcat_s_1', float('nan')):.5g}",
                                    f"{ft['km_mM']:.4g}",
                                    f"{ft['ki_mM']:.4g}",
                                    f"{ft.get('r2', float('nan')):.4g}",
                                    str(ft.get('n', ''))])
             else:
-                param_rows.append([phase_label, 'Not fit', '—', '—', '—', '—'])
-        header = ['Phase', 'Vmax (µM/s)', 'KM (mM)', 'KI (mM)', 'R²', 'n']
+                param_rows.append([phase_label, '—', 'Not fit', '—', '—', '—', '—', '—'])
+        header = ['Phase', '[E] (nM)', 'Vmax (µM/s)', 'kcat (s^-1)', 'KM (mM)', 'KI (mM)', 'R²', 'n']
         tab = ax.table(cellText=param_rows, colLabels=header, cellLoc='center',
-                       colLoc='center', loc='upper center', bbox=[.04, .72, .92, .13],
-                       colWidths=[.22,.18,.17,.17,.13,.13])
-        tab.auto_set_font_size(False); tab.set_fontsize(10)
+                       colLoc='center', loc='upper center', bbox=[.03, .72, .94, .13],
+                       colWidths=[.19,.10,.15,.13,.12,.12,.10,.09])
+        tab.auto_set_font_size(False); tab.set_fontsize(8.8)
         for (i,j), cell in tab.get_celld().items():
             cell.set_edgecolor('#D8DEE2')
             if i == 0: cell.set_facecolor('#EBF1F5'); cell.set_text_props(weight='bold')
         ax.text(.06, .68, 'Descriptive apparent parameters: v = Vmax[S] / (KM + [S] + [S]²/KI).',
                 transform=ax.transAxes, fontsize=9)
-        ax.text(.06, .645, 'kcat is not computed: enzyme active-site concentration is not entered. Fit errors are not estimated.',
+        ax.text(.06, .645, 'kcat = 1000 x Vmax (µM/s) / [E] active sites (nM); no parameter errors are estimated.',
                 transform=ax.transAxes, fontsize=8.6)
         warnings = [f"{label}: {substrate_fits[key].get('warning')}"
                     for key,label in phase_names
@@ -324,19 +326,21 @@ def make_acceptance_pdf(summary: pd.DataFrame, primary_fits: dict,
                      fontweight='bold', y=.96)
         rows = []
         for enzyme_name, ft in sorted(primary_fits.items()):
-            rows.append([str(enzyme_name)[:28],
+            rows.append([str(enzyme_name)[:22],
+                         f"{ft.get('enzyme_concentration_nM', float('nan')):.5g}",
                          f"{ft['vmax_uM_s']:.5g}",
+                         f"{ft.get('kcat_s_1', float('nan')):.5g}",
                          f"{ft['km_mM']:.5g}",
                          f"{ft['ki_mM']:.5g}",
                          f"{ft.get('r2', float('nan')):.4g}",
                          str(ft.get('n', ''))])
         if rows:
-            hdr = ['Enzyme', 'Vmax (µM/s)', 'KM (mM)', 'KI (mM)', 'R²', 'n']
+            hdr = ['Enzyme', '[E] nM', 'Vmax µM/s', 'kcat s^-1', 'KM mM', 'KI mM', 'R²', 'n']
             tab = ax.table(cellText=rows, colLabels=hdr, cellLoc='center',
-                           colLoc='center', colWidths=[.32,.17,.15,.15,.12,.09],
+                           colLoc='center', colWidths=[.24,.105,.14,.14,.125,.125,.07,.055],
                            loc='upper center', bbox=[.05, max(.30, .82-.055*len(rows)), .90,
                                                      min(.45, .075+.055*len(rows))])
-            tab.auto_set_font_size(False); tab.set_fontsize(10)
+            tab.auto_set_font_size(False); tab.set_fontsize(8.4)
             for (i,j), cell in tab.get_celld().items():
                 cell.set_edgecolor('#D8DEE2')
                 if i == 0: cell.set_facecolor('#EBF1F5'); cell.set_text_props(weight='bold')
@@ -352,7 +356,7 @@ def make_acceptance_pdf(summary: pd.DataFrame, primary_fits: dict,
                     transform=ax.transAxes, fontsize=11)
         ax.text(.06,.15,'Model: v = Vmax[S] / (KM + [S] + [S]²/KI)', fontsize=10,
                 transform=ax.transAxes)
-        ax.text(.06,.11,'Apparent parameters only; enzyme concentration is not entered, so kcat is not calculated.',
+        ax.text(.06,.11,'kcat = 1000 × Vmax (µM/s) / final active-site [E] (nM). Values are apparent.',
                 fontsize=9, transform=ax.transAxes)
         ax.text(.06,.075,'Fit uncertainties are not estimated by the current fitting routine.',
                 fontsize=9, transform=ax.transAxes)
