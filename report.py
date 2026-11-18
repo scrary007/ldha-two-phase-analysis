@@ -164,6 +164,9 @@ def make_all_traces_pdf(parsed: dict, fits: dict, summary: pd.DataFrame,
                 except (TypeError, ValueError, KeyError):
                     fig_text = 'Could not calculate both velocities'
                 fig_text += f'  |  mixing cutoff {cutoff:g} s'
+                if str(row.get('acceptance_status', '')) == 'Accepted':
+                    chosen = str(row.get('accepted_method', ''))
+                    fig_text += f'  |  accepted: {chosen[:19]}'
                 ax.text(.02, .03, fig_text, transform=ax.transAxes,
                         fontsize=8, ha='left', va='bottom',
                         bbox={'facecolor':'white','edgecolor':'none','alpha':.82,'pad':1.5})
@@ -183,4 +186,126 @@ def make_all_traces_pdf(parsed: dict, fits: dict, summary: pd.DataFrame,
                                 wspace=.26, hspace=.42)
             pdf.savefig(fig, bbox_inches=None)
             plt.close(fig)
+    return output.getvalue()
+
+
+def make_acceptance_pdf(summary: pd.DataFrame, primary_fits: dict,
+                        settings: dict | None = None) -> bytes:
+    """Export explicit decisions for every trace and the verified primary v0 curves.
+
+    Separate from the legacy 3-page exploratory report. PDF output preserves
+    the chosen method, the manual primary eligibility decision, and notes.
+    """
+    from textwrap import wrap
+
+    if summary.empty:
+        raise ValueError('No time courses were supplied.')
+    output = BytesIO()
+    settings = settings or {}
+    columns = ['File', '[Pyr] mM', 'Screening', 'Approval', 'Method', 'v0 (uM/s)', 'In v0?']
+
+    with PdfPages(output) as pdf:
+        # Table pages; 12 per page keeps filenames and method names readable.
+        rowcount = 12
+        pages = int(np.ceil(len(summary) / rowcount))
+        for page, start in enumerate(range(0, len(summary), rowcount), start=1):
+            subset = summary.iloc[start:start + rowcount]
+            fig, ax = plt.subplots(figsize=(11, 8.5)); ax.axis('off')
+            fig.suptitle('LDHA | Accepted time-course analyses', fontsize=16, fontweight='bold', y=.96)
+            fig.text(.05, .90, f'Analysis decisions | page {page} of {pages} | '
+                     'Unaccepted or stale decisions are NOT primary velocities', fontsize=9)
+            records = []
+            for _, r in subset.iterrows():
+                def trunc(x, n):
+                    text = str(x) if pd.notna(x) else ''
+                    return text if len(text) <= n else text[:n-1] + '…'
+                conc = pd.to_numeric(r.get('pyruvate_mM'), errors='coerce')
+                v = pd.to_numeric(r.get('accepted_v0_uM_s'), errors='coerce')
+                outcome_short = {
+                    'No detectable time-dependent change': 'Linear-like',
+                    'Detectable time-dependent change': 'Time change',
+                    'Transition rate unresolved': 'Rate unresolved',
+                    'Not assessed': 'Not assessed',
+                }.get(str(r.get('timecourse_outcome', '')), 'Unclassified')
+                records.append([trunc(r.get('file',''), 29),
+                                f'{conc:.4g}' if pd.notna(conc) else '',
+                                outcome_short,
+                                trunc(r.get('acceptance_status', ''), 25),
+                                trunc(r.get('accepted_method', ''), 27),
+                                f'{v:.4g}' if pd.notna(v) else '',
+                                'YES' if r.get('primary_verified', False) else 'no'])
+            tab = ax.table(cellText=records, colLabels=columns, cellLoc='left', colLoc='left',
+                           colWidths=[.26,.08,.13,.15,.21,.09,.08],
+                           loc='upper left', bbox=[.02, .15, .96, .70])
+            tab.auto_set_font_size(False); tab.set_fontsize(8)
+            tab.scale(1,1.18)
+            for (i,j), cell in tab.get_celld().items():
+                cell.set_edgecolor('#D8DEE2')
+                if i == 0:
+                    cell.set_facecolor('#EBF1F5'); cell.set_text_props(weight='bold')
+                elif i % 2 == 0:
+                    cell.set_facecolor('#F8FAFC')
+            fig.text(.055,.11,'Primary = researcher accepted the method AND explicitly verified initial-rate suitability.',fontsize=9)
+            fig.text(.055,.08,'Screening: Linear-like = no detectable rate change; Time change = supported curvature;',fontsize=8.5)
+            fig.text(.055,.055,'Rate unresolved = curvature but poorly constrained k. Exponential initial = first postmix sample.',fontsize=8.5)
+            pdf.savefig(fig); plt.close(fig)
+
+        # Main analysis plot for each enzyme represented by verified velocities.
+        valid = summary.copy()
+        mask = (valid['primary_verified'].fillna(False).astype(bool)
+                & (pd.to_numeric(valid['accepted_v0_uM_s'], errors='coerce') > 0)
+                & (pd.to_numeric(valid['pyruvate_mM'], errors='coerce') > 0))
+        valid = valid.loc[mask]
+        fig, ax = plt.subplots(figsize=(11, 8.5))
+        fig.suptitle('LDHA | Primary accepted initial velocities', fontsize=16, weight='bold', y=.96)
+        if valid.empty:
+            ax.axis('off')
+            ax.text(.5,.54,'No initial-rate-verified, accepted velocities yet.',
+                    ha='center', va='center', fontsize=13, transform=ax.transAxes)
+        else:
+            for idx, (enzyme, group) in enumerate(valid.groupby('enzyme')):
+                mark = ['o','s','D','^','v','P'][idx % 6]
+                points = group.sort_values('pyruvate_mM')
+                ax.scatter(points.pyruvate_mM, points.accepted_v0_uM_s,
+                           s=44, marker=mark, label=f'{enzyme}: accepted v0')
+                ft = primary_fits.get(enzyme)
+                if ft:
+                    x = np.linspace(0, float(points.pyruvate_mM.max()), 350)
+                    ax.plot(x, substrate_inhibition(x, ft['vmax_uM_s'],
+                            ft['km_mM'], ft['ki_mM']), lw=2,
+                            label=f'{enzyme}: descriptive inhibition fit')
+            ax.set(xlabel='[Pyruvate] (mM)', ylabel='Accepted v0 (uM/s)')
+            ax.grid(alpha=.16); ax.legend(fontsize=9)
+        fig.text(.07,.085,'Curve fit is descriptive; mixed methods and postmix extrapolation require scientific review.',fontsize=9)
+        fig.subplots_adjust(left=.12, right=.95, top=.88, bottom=.17)
+        pdf.savefig(fig); plt.close(fig)
+
+        # Preserve full reviewer notes and cautions, not just truncated table cells.
+        paragraphs = ['Interpretation and selection record',
+                      'Approval is specific to the analysis settings used at the time it was accepted.',
+                      'Stale or unaccepted fits cannot enter the primary dataset.',
+                      'Actual NADH conversion is not established by A340 changes without matched blanks.',
+                      'Exponential-model starting velocity is at first retained POSTMIX time, not t=0.',
+                      '']
+        paragraphs += [f'{key}: {value}' for key,value in settings.items()]
+        paragraphs.append('')
+        for _,r in summary.iterrows():
+            paragraphs.append(f"{r['file']} | {r.get('timecourse_outcome', '')} | "
+                              f"{r.get('acceptance_status', '')} | {r.get('accepted_method', '')}")
+            if str(r.get('accepted_basis', '')).strip():
+                paragraphs.append('Basis: ' + str(r['accepted_basis']))
+            if str(r.get('accepted_caution', '')).strip():
+                paragraphs.append('Caution: ' + str(r['accepted_caution']))
+            if str(r.get('reviewer_note', '')).strip():
+                paragraphs.append('Reviewer note: ' + str(r['reviewer_note']))
+            paragraphs.append('')
+        lines = []
+        for para in paragraphs:
+            lines.extend(wrap(para, width=112, break_long_words=False) or [''])
+        for start in range(0, len(lines), 34):
+            fig, ax = plt.subplots(figsize=(11, 8.5)); ax.axis('off')
+            fig.suptitle('LDHA | Analysis notes and cautions', fontsize=15, weight='bold', y=.96)
+            ax.text(.05,.89,'\n'.join(lines[start:start+34]), transform=ax.transAxes,
+                    va='top', fontsize=9, family='DejaVu Sans', linespacing=1.55)
+            pdf.savefig(fig); plt.close(fig)
     return output.getvalue()

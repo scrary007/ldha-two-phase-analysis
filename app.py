@@ -17,11 +17,14 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from analysis import (
-    DataError, apparent_postmix_fraction, filename_pyruvate, fit_all_models, fit_line,
+    DataError, apparent_postmix_fraction, classify_timecourse, filename_pyruvate, fit_all_models, fit_line,
     fit_substrate_inhibition, read_cary_csv, recommended_windows,
     signal_slope_to_velocity, substrate_inhibition,
 )
-from report import make_pdf, make_all_traces_pdf
+from report import make_pdf, make_all_traces_pdf, make_acceptance_pdf
+from acceptance import (SINGLE, EXPONENTIAL, EARLY, EXCLUDE, METHODS, suggest_method,
+                        analysis_fingerprint, compute_candidate, apply_approvals,
+                        preserve_trace_controls)
 
 
 st.set_page_config(page_title='LDHA | Biphasic time courses', layout='wide',
@@ -90,6 +93,10 @@ if not parsed:
     st.error('No valid time-course files could be read.')
     st.stop()
 
+# Streamlit otherwise clears a trace's widgets when the user switches files.
+# Preserve each trace's fitting windows, chosen method, checkbox, and notes.
+preserve_trace_controls(st.session_state, [d['uid'] for d in parsed.values()])
+
 st.subheader('Select experiments and enter concentrations')
 st.success(f'{len(parsed)} CSV file(s) successfully read.')
 st.caption('Use the controls below to select traces and check concentrations. '
@@ -144,6 +151,11 @@ for name, obj in parsed.items():
         key = f'{prefix}_{part}'
         if key not in st.session_state:
             st.session_state[key] = round(float(value), 3)
+    for part, value in [('single_start', defaults['early_start']),
+                        ('single_end', defaults['early_end'])]:
+        key = f'{prefix}_{part}'
+        if key not in st.session_state:
+            st.session_state[key] = round(float(value), 3)
 
 curr_uid = parsed[current]['uid']; curr_df = parsed[current]['df']
 tmin, tmax = float(curr_df.time_s.min()), float(curr_df.time_s.max())
@@ -195,7 +207,8 @@ for _, row in selected_rows.iterrows():
     except (ValueError, TypeError):
         s = np.nan
     rec = {'file': name, 'enzyme': label, 'pyruvate_mM': s,
-           'n_points': len(t), 'issue': '', 'mixing_cutoff_s': float(st.session_state[f'{uid}_mixing_cutoff'])}
+           'n_points': len(t), 'issue': '', 'timecourse_outcome': 'Not assessed',
+           'mixing_cutoff_s': float(st.session_state[f'{uid}_mixing_cutoff'])}
     early = late = models = None
     try:
         limits = {k: float(st.session_state[f'{uid}_{k}'])
@@ -221,6 +234,14 @@ for _, row in selected_rows.iterrows():
                    late_start_s=late['start_s'],late_end_s=late['end_s'])
         models = fit_all_models(d['df'], dead_time_s=cutoff)
         trans, seg = models['transition'], models['segmented']
+        outcome = classify_timecourse(models)
+        rec.update(timecourse_outcome=outcome['label'],
+                   outcome_reason=outcome['reason'],
+                   suggested_next_step=outcome['next_step'],
+                   aicc_improvement_exponential=outcome['exponential_aicc_gain'],
+                   aicc_improvement_segmented=outcome['segmented_aicc_gain'],
+                   exponential_k_bound_side=outcome['k_bound_side'],
+                   k_obs_interpretable=outcome['k_interpretable'])
         rec.update(k_obs_s_1=trans['k_obs_s_1'],
                    t_half_s=trans['t_half_s'],
                    v_transition_initial_uM_s=signal_slope_to_velocity(
@@ -254,8 +275,8 @@ for _, row in selected_rows.iterrows():
             quality.append('early window >10% apparent NADH-equivalent change after mixing; not an initial-rate window')
         if v1 <= 0 or v2 <= 0:
             quality.append('nonpositive phase velocity')
-        if trans['k_at_bound']:
-            quality.append('exponential k at fitting bound')
+        if outcome['label'] == 'Transition rate unresolved':
+            quality.append('time-dependent transition suggested, but k_obs is unresolved')
         rec['issue'] = '; '.join(quality)
     except (DataError, ValueError, np.linalg.LinAlgError) as exc:
         rec['issue'] = str(exc)
@@ -359,7 +380,7 @@ if plot_view == 'All time courses (grid)':
                'Select **One time course** for an enlarged plot and model diagnostics.')
     with st.expander('Early and late velocities for all displayed traces'):
         cols = ['file', 'pyruvate_mM', 'v_early_uM_s', 'v_late_uM_s',
-                'v_late_over_early', 'issue']
+                'v_late_over_early', 'timecourse_outcome', 'issue']
         st.dataframe(summary[[c for c in cols if c in summary]],
                      hide_index=True, use_container_width=True)
 else:
@@ -397,7 +418,11 @@ else:
         cc1.metric('Early v (μM/s)',f"{r['v_early_uM_s']:.4g}")
         cc2.metric('Late v (μM/s)',f"{r['v_late_uM_s']:.4g}")
         cc3.metric('Late / early',f"{r['v_late_over_early']:.3f}" if np.isfinite(r['v_late_over_early']) else '—')
-        cc4.metric('Exponential k_obs (s⁻¹)',f"{r['k_obs_s_1']:.3g}" if pd.notna(r['k_obs_s_1']) else '—')
+        cc4.metric('Exponential k_obs (s⁻¹)',
+                   f"{r['k_obs_s_1']:.3g}" if r.get('k_obs_interpretable', False)
+                   and pd.notna(r['k_obs_s_1']) else 'Not resolved')
+        st.info(f"**{r['timecourse_outcome']}** — {r['outcome_reason']}\n\n"
+                f"**Suggested action:** {r['suggested_next_step']}")
         if str(r['issue']):
             st.warning(str(r['issue']))
     else:
@@ -415,6 +440,212 @@ else:
             st.caption('AICc is comparable only because all three models fit the same retained '
                        'time points. The best (lowest) AICc is not proof of a particular chemical mechanism. '
                        'Breakpoint-search AICc is approximate.')
+
+# Explicit per-trace method acceptance. No acceptance is saved to the cloud.
+st.subheader('Accept an analysis for each time course')
+st.caption('The suggested model is a starting point. Choose another method if the data justify it. '
+           'Only explicitly accepted and independently verified rates enter the **primary initial-velocity** dataset. '
+           'These choices persist only in this browser session; download the CSV/PDF to retain them.')
+current_row = summary.loc[summary['file'] == current].iloc[0]
+current_fit = fits[current]
+current_outcome = str(current_row['timecourse_outcome'])
+suggested = suggest_method(current_outcome)
+method_key = f'approval_method_{curr_uid}'
+if method_key not in st.session_state:
+    st.session_state[method_key] = suggested
+st.markdown(f'**{current}** — suggested: **{suggested}**  \n'
+            f'Screening outcome: *{current_outcome}*')
+method = st.selectbox('Method to use for this trace', METHODS, key=method_key,
+                      help='The suggestion is not an automatic acceptance. Exclude any trace unsuitable for analysis.')
+# Selecting a different method must require a fresh initial-rate suitability check.
+prior_methods = st.session_state.setdefault('_prior_analysis_methods', {})
+if curr_uid in prior_methods and prior_methods[curr_uid] != method:
+    st.session_state[f'approval_primary_{curr_uid}'] = False
+prior_methods[curr_uid] = method
+if method != suggested:
+    st.caption('You have overridden the suggested method. Explain your decision in the reviewer note.')
+if method == SINGLE:
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        st.number_input('Single linear start (s)', min_value=tmin, max_value=tmax,
+                        step=.5, key=f'{curr_uid}_single_start')
+    with sc2:
+        st.number_input('Single linear end (s)', min_value=tmin, max_value=tmax,
+                        step=.5, key=f'{curr_uid}_single_end')
+
+candidate = None
+if current_fit['models'] is not None or method == EXCLUDE:
+    try:
+        candidate = compute_candidate(
+            method, curr_df.time_s.to_numpy(float), curr_df.absorbance.to_numpy(float),
+            current_fit,
+            single_start_s=float(st.session_state[f'{curr_uid}_single_start']),
+            single_end_s=float(st.session_state[f'{curr_uid}_single_end']),
+            cutoff_s=float(st.session_state[f'{curr_uid}_mixing_cutoff']),
+            extinction=extinction, path_cm=path_cm, blank_slope=blank_slope,
+            initial_nadh=initial_nadh, outcome=current_outcome)
+        if candidate['v0_uM_s'] is not None:
+            st.write(f"**Candidate velocity:** {candidate['v0_uM_s']:.5g} μM/s  "
+                     f"· Basis: {candidate['basis']}")
+        else:
+            st.write('No velocity will be exported for this excluded trace.')
+        if candidate['k_obs_s_1'] is not None:
+            st.write(f"**Interpretable descriptive k_obs:** {candidate['k_obs_s_1']:.4g} s⁻¹")
+        if candidate['warning']:
+            st.warning(candidate['warning'])
+        if method != EXCLUDE:
+            with st.expander('Inspect selected-method fit and residuals', expanded=(method == SINGLE)):
+                tt = curr_df.time_s.to_numpy(float)
+                yy = curr_df.absorbance.to_numpy(float)
+                if method == SINGLE:
+                    line = candidate['single_fit']
+                    tt_min, tt_max = line['start_s'], line['end_s']
+                    mask = (tt >= tt_min) & (tt <= tt_max)
+                    fit_t = tt[mask]
+                    predicted = line['intercept_A'] + line['slope_A_s'] * fit_t
+                    st.caption(f"Single-line fit: R² = {line['r2']:.5f}; "
+                               f"n = {line['n']} points; "
+                               f"slope SE = {line['slope_se_A_s']:.3g} A/s.")
+                elif method == EARLY:
+                    line = current_fit['early']
+                    mask = (tt >= line['start_s']) & (tt <= line['end_s'])
+                    fit_t = tt[mask]
+                    predicted = line['intercept_A'] + line['slope_A_s'] * fit_t
+                else:
+                    fit_t = current_fit['models']['t']
+                    mask = tt >= float(st.session_state[f'{curr_uid}_mixing_cutoff'])
+                    predicted = current_fit['models']['transition']['predicted_A']
+                observed = yy[mask]
+                residual_fig = go.Figure()
+                residual_fig.add_trace(go.Scatter(x=fit_t, y=observed-predicted,
+                                                   mode='markers', marker=dict(color=BLUE,size=5),
+                                                   name='Observed - fit'))
+                residual_fig.add_hline(y=0, line_dash='dash', line_color=GRAY)
+                residual_fig.update_layout(height=230, xaxis_title='Time (s)',
+                                           yaxis_title='A340 residual',
+                                           margin=dict(l=25,r=15,t=15,b=25))
+                st.plotly_chart(residual_fig,use_container_width=True)
+    except (DataError, ValueError) as exc:
+        st.error(f'This analysis method is not available: {exc}')
+else:
+    st.error('This trace has no valid model fit. Adjust the fitting settings first.')
+
+verified_key = f'approval_primary_{curr_uid}'
+if verified_key not in st.session_state:
+    st.session_state[verified_key] = False
+st.checkbox('I checked initial-rate suitability and want to include this accepted velocity '
+            'in the primary v₀ versus [pyruvate] analysis', key=verified_key,
+            disabled=bool(candidate is None or not candidate['eligible_for_primary'] or method == EXCLUDE),
+            help='Review mixing loss, linearity/model residuals, possible depletion, and pyruvate-matched blanks. '
+                 'Absorbance changes alone do not prove NADH conversion. Do not tick this for questionable initial rates.')
+if candidate is None or not candidate['eligible_for_primary'] or method == EXCLUDE:
+    # Disabled checkbox may retain a previous True value in Streamlit state;
+    # never include that value in the fingerprint or accepted record.
+    primary_checked = False
+else:
+    primary_checked = bool(st.session_state[verified_key])
+note_key = f'approval_note_{curr_uid}'
+note = st.text_input('Researcher note (recommended for overrides or questionable traces)',
+                     key=note_key, placeholder='Reason for chosen method or exclusion')
+
+def fingerprint_for(name):
+    d = parsed[name]; uid = d['uid']
+    sr = summary.loc[summary['file'] == name].iloc[0]
+    method_value = st.session_state.get(f'approval_method_{uid}', suggest_method(str(sr['timecourse_outcome'])))
+    checked = (bool(st.session_state.get(f'approval_primary_{uid}', False))
+               if method_value != EXCLUDE and str(sr['timecourse_outcome']) != 'Not assessed' else False)
+    # Exponential may be unresolved; a stale checkbox must never confer eligibility.
+    if method_value == EXPONENTIAL and not bool(sr.get('k_obs_interpretable', False)):
+        checked = False
+    row_meta = selected_rows.loc[selected_rows['Filename'] == name].iloc[0]
+    vals = dict(file_uid=uid, pyruvate_mM=float(row_meta['[Pyruvate] (mM)']),
+                enzyme=str(row_meta['Enzyme']), method=method_value,
+                primary_checked=checked, note=st.session_state.get(f'approval_note_{uid}', ''),
+                extinction=float(extinction), path_cm=float(path_cm),
+                blank_slope=float(blank_slope), initial_nadh=float(initial_nadh))
+    vals.update({x: float(st.session_state[f'{uid}_{x}']) for x in
+                 ('mixing_cutoff', 'early_start', 'early_end', 'late_start',
+                  'late_end', 'single_start', 'single_end')})
+    return analysis_fingerprint(vals)
+
+current_fingerprint = fingerprint_for(current)
+if 'accepted_analyses' not in st.session_state:
+    st.session_state['accepted_analyses'] = {}
+if st.button('Accept this analysis', type='primary', disabled=candidate is None):
+    st.session_state['accepted_analyses'][current] = dict(
+        fingerprint=current_fingerprint, candidate=candidate,
+        primary_verified=bool(primary_checked), note=note)
+    st.success('Analysis accepted for this trace. Download the results to preserve the decision.')
+if st.button('Clear acceptance for this trace'):
+    st.session_state['accepted_analyses'].pop(current, None)
+    st.info('This trace is no longer accepted.')
+
+fingerprints = {name: fingerprint_for(name) for name in names}
+summary_accepted = apply_approvals(summary, st.session_state['accepted_analyses'], fingerprints)
+current_approval = summary_accepted.loc[summary_accepted['file'] == current].iloc[0]
+st.caption(f"Current trace: **{current_approval['acceptance_status']}**"
+           + (f" · {current_approval['accepted_method']}" if current_approval['accepted_method'] else ''))
+with st.expander('Acceptance status for all files', expanded=True):
+    acols = ['file','pyruvate_mM','timecourse_outcome','acceptance_status',
+             'accepted_method','accepted_v0_uM_s','primary_verified','reviewer_note']
+    st.dataframe(summary_accepted[acols], hide_index=True, use_container_width=True)
+
+primary = summary_accepted.loc[summary_accepted['primary_verified'] == True].copy()
+primary = primary[(pd.to_numeric(primary['accepted_v0_uM_s'], errors='coerce') > 0) &
+                  (pd.to_numeric(primary['pyruvate_mM'], errors='coerce') > 0)]
+st.subheader('Primary initial-velocity dataset — accepted and verified only')
+st.caption('This dataset includes only rates explicitly approved for initial-rate use. '
+           'Exponential starting velocities refer to the first retained time point after mixing, '
+           'not t = 0. Manual approval is not proof of an initial-rate condition; '
+           'the exported method and warning fields preserve that distinction.')
+if primary.empty:
+    st.info('No accepted, initial-rate-verified velocities yet. Select a trace, '
+            'choose a suitable method, check the initial-rate criteria, then click Accept this analysis.')
+else:
+    shown = ['file', 'enzyme', 'pyruvate_mM', 'accepted_method',
+             'accepted_v0_uM_s','accepted_v0_se_uM_s',
+             'accepted_reference_time_s','accepted_k_obs_s_1','accepted_caution']
+    st.dataframe(primary[shown], hide_index=True, use_container_width=True)
+
+primary_fits = {}
+if not primary.empty:
+    selected_enzymes = sorted(primary.enzyme.unique())
+    primary_enzyme = (st.selectbox('Primary curve: enzyme/variant', selected_enzymes,
+                                   key='primary_enzyme') if len(selected_enzymes) > 1
+                      else selected_enzymes[0])
+    # Fit every enzyme with sufficient accepted velocities for the exported PDF,
+    # even when only one enzyme is displayed on screen.
+    for enzyme_name, enzyme_rows in primary.groupby('enzyme'):
+        try:
+            primary_fits[enzyme_name] = fit_substrate_inhibition(
+                enzyme_rows.pyruvate_mM.to_numpy(float),
+                enzyme_rows.accepted_v0_uM_s.to_numpy(float))
+        except DataError:
+            pass
+    primary_group = primary[primary.enzyme == primary_enzyme]
+    primary_fig = go.Figure()
+    for method_label, points in primary_group.groupby('accepted_method'):
+        primary_fig.add_trace(go.Scatter(
+            x=points.pyruvate_mM, y=points.accepted_v0_uM_s,
+            mode='markers', name=method_label,
+            marker=dict(size=10), text=points.file,
+            hovertemplate='%{text}<br>[Pyr]=%{x:.4g} mM<br>v₀=%{y:.4g} μM/s<extra></extra>'))
+    if primary_enzyme in primary_fits:
+        ft = primary_fits[primary_enzyme]
+        x = np.linspace(0, float(primary_group.pyruvate_mM.max()), 400)
+        primary_fig.add_trace(go.Scatter(x=x,
+                           y=substrate_inhibition(x, ft['vmax_uM_s'], ft['km_mM'], ft['ki_mM']),
+                           name='Accepted-v₀ substrate-inhibition fit',mode='lines',
+                           line=dict(color=BLUE, width=2)))
+        st.markdown(f"**Descriptive accepted-v₀ fit:** Vmax = {ft['vmax_uM_s']:.4g} μM/s; "
+                    f"KM = {ft['km_mM']:.4g} mM; KI = {ft['ki_mM']:.4g} mM. "
+                    f"{ft.get('warning', '')}")
+    else:
+        st.caption('At least five distinct positive concentrations with accepted, verified '
+                   'velocities are required for the primary substrate-inhibition fit.')
+    primary_fig.update_layout(xaxis_title='[Pyruvate] (mM)', yaxis_title='Accepted v₀ (μM/s)',
+                              height=390,margin=dict(l=30,r=25,t=15,b=30))
+    st.plotly_chart(primary_fig, use_container_width=True)
 
 st.subheader('Velocities versus [pyruvate]')
 if summary['enzyme'].nunique() > 1:
@@ -486,9 +717,12 @@ st.caption('Apparent fraction columns describe A340 changes after the per-trace 
            'A late phase beyond 10% is not automatically a failed fit. '
            'High baseline absorbance at concentrated pyruvate warrants substrate-matched blanks, '
            'but it is not automatically a failed measurement.')
-st.dataframe(summary,hide_index=True,use_container_width=True)
+st.dataframe(summary_accepted,hide_index=True,use_container_width=True)
+st.caption('The time-course outcomes are exploratory screening labels (AICc improvement ≥10 '
+           'and modeled slope change ≥10%), not formal significance tests or evidence of '
+           'pyruvate–NAD⁺ adduct formation. They do not account for serially correlated noise.')
 
-csv_content=summary.to_csv(index=False).encode('utf-8-sig')
+csv_content=summary_accepted.to_csv(index=False).encode('utf-8-sig')
 col1,col2,col3=st.columns(3)
 with col1:
     st.download_button('Download full velocity summary (CSV)',csv_content,
@@ -501,6 +735,10 @@ with col2:
                   'Initial NADH (uM)':initial_nadh,
                   'Blank slope (A/s)':blank_slope,
                   'Mixing cutoff for selected trace (s)': selected['mixing_cutoff_s'],
+                  'Accepted status': current_approval['acceptance_status'],
+                  'Accepted method': current_approval['accepted_method'],
+                  'Primary v0 verified': current_approval['primary_verified'],
+                  'Accepted v0 (uM/s)': current_approval['accepted_v0_uM_s'],
                   'Postmix apparent fraction to late end (NOT true NADH depletion)':
                       float(summary.loc[summary['file']==current, 'apparent_fraction_to_late_end_postmix'].iloc[0])}
         pdf=make_pdf(current,curr_df,models,selected['early'],selected['late'],
@@ -533,7 +771,7 @@ with pdf_extra1:
 with pdf_extra2:
     pdf_show_segmented = st.checkbox('Include segmented fits in PDF', value=False)
 all_traces_pdf = make_all_traces_pdf(
-    parsed, fits, summary,
+    parsed, fits, summary_accepted,
     settings={'Mixing cutoff': 'per trace, listed in plots'},
     show_exponential=pdf_show_exponential,
     show_segmented=pdf_show_segmented,
@@ -545,8 +783,45 @@ st.caption('Includes every selected trace, with its early and late fitted lines.
            'Plots share a time axis but use separate absorbance scales. '
            'The existing 3-page PDF report remains available above.')
 
-with st.expander('Scientific limitations and suggested controls'):
+st.markdown('**Download accepted analysis results**')
+ac1, ac2 = st.columns(2)
+with ac1:
+    st.download_button('Download accepted primary v₀ dataset (CSV)',
+                       primary.to_csv(index=False).encode('utf-8-sig'),
+                       file_name='LDHA_accepted_initial_velocities.csv', mime='text/csv',
+                       disabled=primary.empty,
+                       help='Only explicitly accepted and verified initial velocities.')
+with ac2:
+    accepted_pdf = make_acceptance_pdf(summary_accepted, primary_fits,
+                                      settings={'Initial NADH (uM)':initial_nadh,
+                                                'Extinction coefficient (mM^-1 cm^-1)':extinction,
+                                                'Pathlength (cm)':path_cm,
+                                                'Blank slope (A/s)':blank_slope})
+    st.download_button('Download accepted-analysis report (PDF)', accepted_pdf,
+                       file_name='LDHA_accepted_analysis.pdf', mime='application/pdf',
+                       help='All files, selected analysis methods, review notes and primary v0 fits.')
+
+with st.expander('Interpretation notes — what to do next', expanded=True):
     st.markdown('''
+**1. No detectable time-dependent change**
+
+- **Interpretation:** The post-mixing time course is adequately described by a straight line under the current experimental conditions. At low [pyruvate], this may be exactly what we expect. It does **not** mean substrate inhibition is absent; a constant but inhibited velocity can be linear.
+- **Analysis in this app:** Choose **Single linear window** under **Accept an analysis**, adjust the independent linear window, confirm initial-rate suitability, then click **Accept this analysis**. Do not use exponential k_obs.
+
+**2. Detectable time-dependent change**
+
+- **Interpretation:** The exponential model captures appreciable curvature beyond a straight line, and its k_obs is not at a bound. The rate may slow **or** accelerate; curvature alone does not demonstrate a pyruvate–NAD⁺ adduct.
+- **Analysis in this app:** Choose **Exponential transition** under **Accept an analysis** if the fit and residuals are defensible. Its model starting velocity is **at the first post-mixing data point**, not necessarily reaction time zero. Confirm initial-rate suitability separately before including it in the primary plot. Report k_obs only when resolved.
+
+**3. Transition rate unresolved**
+
+- **Interpretation:** The trace suggests curvature, but the exponential k_obs is at a bound or its form is not well supported by the data. **Do not report k_obs as a measured transition rate.**
+- **What to do:** Check mixing and residuals first. If the transition is potentially **faster** than the mixing cutoff, use faster mixing/acquisition; if potentially **slower** than the observation period, collect longer traces with appropriate depletion controls. Repeat under matched conditions. The boundary direction, when available, is listed in the results table.
+
+These three automated outcomes use **exploratory thresholds**: ≥10 AICc units of improvement over a straight line **and** ≥10% modeled change in slope. They are not formal hypothesis tests; closely spaced measurements may have correlated noise. A visible change in slope is not proof of the inhibition mechanism.
+
+**Additional limitations and controls**
+
 - Early/late slopes depend on the selected windows. A visible curve may not have two genuinely linear phases.
 - An exponential slope transition is phenomenological. Its **k_obs** is not automatically an adduct formation constant.
 - As NADH decreases and NAD⁺ builds up, the reaction environment changes; late-phase rates may be product- or substrate-dependent.
