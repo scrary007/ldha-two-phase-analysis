@@ -62,7 +62,41 @@ def make_pdf(name: str, df: pd.DataFrame, fit_models: dict,
         pdf.savefig(fig); plt.close(fig)
 
         fig, ax = plt.subplots(figsize=(10.5, 7.6)); ax.axis('off')
-        fig.suptitle('Analysis settings and limitations', fontsize=15, weight='bold')
+        fig.suptitle('Analysis settings and fitted kinetic parameters', fontsize=15, weight='bold')
+        # These fits describe the EARLY and LATE linear windows, respectively;
+        # they do not combine with the separate accepted-initial-velocity dataset.
+        phase_names = [('v_early_uM_s', 'Early window'),
+                       ('v_late_uM_s', 'Late window')]
+        param_rows = []
+        for phase_key, phase_label in phase_names:
+            ft = substrate_fits.get(phase_key)
+            if ft:
+                param_rows.append([phase_label,
+                                   f"{ft['vmax_uM_s']:.4g}",
+                                   f"{ft['km_mM']:.4g}",
+                                   f"{ft['ki_mM']:.4g}",
+                                   f"{ft.get('r2', float('nan')):.4g}",
+                                   str(ft.get('n', ''))])
+            else:
+                param_rows.append([phase_label, 'Not fit', '—', '—', '—', '—'])
+        header = ['Phase', 'Vmax (µM/s)', 'KM (mM)', 'KI (mM)', 'R²', 'n']
+        tab = ax.table(cellText=param_rows, colLabels=header, cellLoc='center',
+                       colLoc='center', loc='upper center', bbox=[.04, .72, .92, .13],
+                       colWidths=[.22,.18,.17,.17,.13,.13])
+        tab.auto_set_font_size(False); tab.set_fontsize(10)
+        for (i,j), cell in tab.get_celld().items():
+            cell.set_edgecolor('#D8DEE2')
+            if i == 0: cell.set_facecolor('#EBF1F5'); cell.set_text_props(weight='bold')
+        ax.text(.06, .68, 'Descriptive apparent parameters: v = Vmax[S] / (KM + [S] + [S]²/KI).',
+                transform=ax.transAxes, fontsize=9)
+        ax.text(.06, .645, 'kcat is not computed: enzyme active-site concentration is not entered. Fit errors are not estimated.',
+                transform=ax.transAxes, fontsize=8.6)
+        warnings = [f"{label}: {substrate_fits[key].get('warning')}"
+                    for key,label in phase_names
+                    if key in substrate_fits and substrate_fits[key].get('warning')]
+        if warnings:
+            ax.text(.06, .608, 'Warnings: ' + ' | '.join(warnings)[:145],
+                    transform=ax.transAxes, fontsize=8, color='#A33D2B')
         description = [f'{k}: {v}' for k,v in settings.items()]
         description += ['', 'Interpretation notes:',
                         '• The early and late slopes depend on selected time windows.',
@@ -72,8 +106,8 @@ def make_pdf(name: str, df: pd.DataFrame, fit_models: dict,
                         '• NADH depletion, NAD+ accumulation, and mixing can alter progress curves.',
                         '• Apparent Km and Ki may vary with the fitting window and model.',
                         '• Confirm findings using controls and independent replicate assays.']
-        ax.text(.08,.92,'\n'.join(description), va='top', fontsize=11,
-                family='DejaVu Sans', linespacing=1.65, transform=ax.transAxes)
+        ax.text(.06,.555,'\n'.join(description), va='top', fontsize=9.2,
+                family='DejaVu Sans', linespacing=1.45, transform=ax.transAxes)
         pdf.savefig(fig); plt.close(fig)
     return output.getvalue()
 
@@ -191,10 +225,10 @@ def make_all_traces_pdf(parsed: dict, fits: dict, summary: pd.DataFrame,
 
 def make_acceptance_pdf(summary: pd.DataFrame, primary_fits: dict,
                         settings: dict | None = None) -> bytes:
-    """Export explicit decisions for every trace and the verified primary v0 curves.
+    """Export explicit decisions for every trace and the selected primary v0 curves.
 
     Separate from the legacy 3-page exploratory report. PDF output preserves
-    the chosen method, the manual primary eligibility decision, and notes.
+    the chosen method, the researcher's kinetic/descriptive/exclude decision, and notes.
     """
     from textwrap import wrap
 
@@ -202,7 +236,7 @@ def make_acceptance_pdf(summary: pd.DataFrame, primary_fits: dict,
         raise ValueError('No time courses were supplied.')
     output = BytesIO()
     settings = settings or {}
-    columns = ['File', '[Pyr] mM', 'Screening', 'Approval', 'Method', 'v0 (uM/s)', 'In v0?']
+    columns = ['File', '[Pyr] mM', 'Screening', 'Decision', 'Method', 'v0 (uM/s)', 'In v0?']
 
     with PdfPages(output) as pdf:
         # Table pages; 12 per page keeps filenames and method names readable.
@@ -230,7 +264,10 @@ def make_acceptance_pdf(summary: pd.DataFrame, primary_fits: dict,
                 records.append([trunc(r.get('file',''), 29),
                                 f'{conc:.4g}' if pd.notna(conc) else '',
                                 outcome_short,
-                                trunc(r.get('acceptance_status', ''), 25),
+                                {'Accept for kinetic analysis': 'Kinetic',
+                                 'Accept for descriptive analysis only': 'Descriptive',
+                                 'Exclude trace': 'Excluded'}.get(
+                                    str(r.get('review_decision', '')), 'Not reviewed'),
                                 trunc(r.get('accepted_method', ''), 27),
                                 f'{v:.4g}' if pd.notna(v) else '',
                                 'YES' if r.get('primary_verified', False) else 'no'])
@@ -245,12 +282,12 @@ def make_acceptance_pdf(summary: pd.DataFrame, primary_fits: dict,
                     cell.set_facecolor('#EBF1F5'); cell.set_text_props(weight='bold')
                 elif i % 2 == 0:
                     cell.set_facecolor('#F8FAFC')
-            fig.text(.055,.11,'Primary = researcher accepted the method AND explicitly verified initial-rate suitability.',fontsize=9)
+            fig.text(.055,.11,'Primary = researcher selected kinetic analysis. Review initial-rate suitability; this is not automated proof.',fontsize=9)
             fig.text(.055,.08,'Screening: Linear-like = no detectable rate change; Time change = supported curvature;',fontsize=8.5)
             fig.text(.055,.055,'Rate unresolved = curvature but poorly constrained k. Exponential initial = first postmix sample.',fontsize=8.5)
             pdf.savefig(fig); plt.close(fig)
 
-        # Main analysis plot for each enzyme represented by verified velocities.
+        # Main analysis plot for each enzyme represented by researcher-selected velocities.
         valid = summary.copy()
         mask = (valid['primary_verified'].fillna(False).astype(bool)
                 & (pd.to_numeric(valid['accepted_v0_uM_s'], errors='coerce') > 0)
@@ -260,7 +297,7 @@ def make_acceptance_pdf(summary: pd.DataFrame, primary_fits: dict,
         fig.suptitle('LDHA | Primary accepted initial velocities', fontsize=16, weight='bold', y=.96)
         if valid.empty:
             ax.axis('off')
-            ax.text(.5,.54,'No initial-rate-verified, accepted velocities yet.',
+            ax.text(.5,.54,'No velocities selected for primary kinetic analysis yet.',
                     ha='center', va='center', fontsize=13, transform=ax.transAxes)
         else:
             for idx, (enzyme, group) in enumerate(valid.groupby('enzyme')):
@@ -280,10 +317,51 @@ def make_acceptance_pdf(summary: pd.DataFrame, primary_fits: dict,
         fig.subplots_adjust(left=.12, right=.95, top=.88, bottom=.17)
         pdf.savefig(fig); plt.close(fig)
 
+        # Report parameter estimates independently for each enzyme/variant.
+        # No fit can be calculated with fewer than five distinct substrate concentrations.
+        fig, ax = plt.subplots(figsize=(11, 8.5)); ax.axis('off')
+        fig.suptitle('LDHA | Accepted v0 kinetic parameters', fontsize=16,
+                     fontweight='bold', y=.96)
+        rows = []
+        for enzyme_name, ft in sorted(primary_fits.items()):
+            rows.append([str(enzyme_name)[:28],
+                         f"{ft['vmax_uM_s']:.5g}",
+                         f"{ft['km_mM']:.5g}",
+                         f"{ft['ki_mM']:.5g}",
+                         f"{ft.get('r2', float('nan')):.4g}",
+                         str(ft.get('n', ''))])
+        if rows:
+            hdr = ['Enzyme', 'Vmax (µM/s)', 'KM (mM)', 'KI (mM)', 'R²', 'n']
+            tab = ax.table(cellText=rows, colLabels=hdr, cellLoc='center',
+                           colLoc='center', colWidths=[.32,.17,.15,.15,.12,.09],
+                           loc='upper center', bbox=[.05, max(.30, .82-.055*len(rows)), .90,
+                                                     min(.45, .075+.055*len(rows))])
+            tab.auto_set_font_size(False); tab.set_fontsize(10)
+            for (i,j), cell in tab.get_celld().items():
+                cell.set_edgecolor('#D8DEE2')
+                if i == 0: cell.set_facecolor('#EBF1F5'); cell.set_text_props(weight='bold')
+            warnings = [f"{enzyme_name}: {ft.get('warning')}" for enzyme_name,ft in sorted(primary_fits.items())
+                        if ft.get('warning')]
+            if warnings:
+                ax.text(.06, .25, 'Fit warnings: ' + '; '.join(warnings)[:180],
+                        transform=ax.transAxes, fontsize=9, color='#A33D2B', wrap=True)
+        else:
+            ax.text(.06, .74, 'No primary substrate-inhibition fit available. At least five distinct',
+                    transform=ax.transAxes, fontsize=11)
+            ax.text(.06, .70, 'positive concentrations with accepted initial velocities are required.',
+                    transform=ax.transAxes, fontsize=11)
+        ax.text(.06,.15,'Model: v = Vmax[S] / (KM + [S] + [S]²/KI)', fontsize=10,
+                transform=ax.transAxes)
+        ax.text(.06,.11,'Apparent parameters only; enzyme concentration is not entered, so kcat is not calculated.',
+                fontsize=9, transform=ax.transAxes)
+        ax.text(.06,.075,'Fit uncertainties are not estimated by the current fitting routine.',
+                fontsize=9, transform=ax.transAxes)
+        pdf.savefig(fig); plt.close(fig)
+
         # Preserve full reviewer notes and cautions, not just truncated table cells.
         paragraphs = ['Interpretation and selection record',
-                      'Approval is specific to the analysis settings used at the time it was accepted.',
-                      'Stale or unaccepted fits cannot enter the primary dataset.',
+                      'The decision is specific to the current analysis settings and must be reviewed after changes.',
+                      'Not reviewed, descriptive-only, and excluded traces cannot enter the primary dataset.',
                       'Actual NADH conversion is not established by A340 changes without matched blanks.',
                       'Exponential-model starting velocity is at first retained POSTMIX time, not t=0.',
                       '']
@@ -291,7 +369,7 @@ def make_acceptance_pdf(summary: pd.DataFrame, primary_fits: dict,
         paragraphs.append('')
         for _,r in summary.iterrows():
             paragraphs.append(f"{r['file']} | {r.get('timecourse_outcome', '')} | "
-                              f"{r.get('acceptance_status', '')} | {r.get('accepted_method', '')}")
+                              f"{r.get('review_decision', '') or r.get('acceptance_status', '')} | {r.get('accepted_method', '')}")
             if str(r.get('accepted_basis', '')).strip():
                 paragraphs.append('Basis: ' + str(r['accepted_basis']))
             if str(r.get('accepted_caution', '')).strip():

@@ -1,7 +1,7 @@
 """Selection and acceptance of LDHA time-course analysis methods.
 
-All automated interpretations are exploratory. Explicit approval and an
-independent initial-rate suitability check are required for the primary v0 set.
+All automated interpretations are exploratory. The researcher's one-choice
+decision controls which fitted velocities enter the primary v0 set.
 """
 from __future__ import annotations
 
@@ -18,6 +18,44 @@ EXPONENTIAL = 'Exponential transition'
 EARLY = 'Early window (provisional)'
 EXCLUDE = 'Exclude trace'
 METHODS = (SINGLE, EXPONENTIAL, EARLY, EXCLUDE)
+
+NOT_REVIEWED = 'Not reviewed'
+KINETIC = 'Accept for kinetic analysis'
+DESCRIPTIVE = 'Accept for descriptive analysis only'
+EXCLUDED = 'Exclude trace'
+DECISIONS = (NOT_REVIEWED, KINETIC, DESCRIPTIVE, EXCLUDED)
+
+
+def available_decisions(candidate: dict | None) -> tuple[str, ...]:
+    """A trace with an unresolved or invalid fit cannot silently enter the v0 plot."""
+    if candidate is None or candidate.get('method') == EXCLUDE:
+        return (NOT_REVIEWED, EXCLUDED)
+    v = candidate.get('v0_uM_s')
+    if v is None or not math.isfinite(v) or v <= 0:
+        return (NOT_REVIEWED, EXCLUDED)
+    if not candidate.get('eligible_for_primary', False):
+        return (NOT_REVIEWED, DESCRIPTIVE, EXCLUDED)
+    return DECISIONS
+
+
+def recommended_decision(outcome: str, candidate: dict | None, issue: str = '') -> str:
+    """Conservative BULK suggestion, not a confirmation of the inhibition mechanism.
+
+    Only nearly linear, unflagged windows with <=10% postmix apparent NADH-
+    equivalent change are suggested for kinetic analysis. Curved and unresolved
+    traces remain descriptive, even if an analyst could manually select a
+    provisional early velocity. The researcher must review the bulk choices.
+    """
+    options = available_decisions(candidate)
+    if options == (NOT_REVIEWED, EXCLUDED):
+        return EXCLUDED
+    if (outcome == 'No detectable time-dependent change'
+            and candidate.get('method') == SINGLE
+            and KINETIC in options and not str(issue).strip()):
+        fraction = candidate.get('apparent_fraction_initial_window')
+        if fraction is not None and math.isfinite(fraction) and fraction <= .10:
+            return KINETIC
+    return DESCRIPTIVE
 
 
 def suggest_method(outcome: str) -> str:
@@ -113,7 +151,7 @@ def apply_approvals(summary, approvals: dict, expected_fingerprints: dict):
     """Append accepted-method columns to a copy of the results table.
 
     Approval entries are ignored when any fitting input changed. The primary
-    dataset includes ONLY explicitly verified, still-current accepted rates.
+    dataset contains ONLY still-current researcher-selected kinetic rates.
     """
     result = summary.copy()
     records = []
@@ -126,7 +164,8 @@ def apply_approvals(summary, approvals: dict, expected_fingerprints: dict):
         is_primary = bool(good and saved.get('primary_verified') and
                           candidate.get('eligible_for_primary') and
                           candidate.get('method') != EXCLUDE)
-        records.append(dict(acceptance_status=status,
+        records.append(dict(review_decision=saved.get('decision', '') if good else '',
+                            acceptance_status=status,
                             accepted_method=candidate.get('method', ''),
                             accepted_v0_uM_s=candidate.get('v0_uM_s'),
                             accepted_v0_se_uM_s=candidate.get('v0_se_uM_s'),
@@ -139,6 +178,22 @@ def apply_approvals(summary, approvals: dict, expected_fingerprints: dict):
                             reviewer_note=saved.get('note', '') if good else ''))
     import pandas as pd
     return pd.concat([result.reset_index(drop=True), pd.DataFrame(records)], axis=1)
+
+
+def invalidate_stale_review(session_state, signatures: dict,
+                            name: str, uid: str, new_signature: str) -> bool:
+    """Clear an old kinetic/descriptive choice when its scientific inputs change.
+
+    Return True when an existing decision was invalidated. This runs before
+    the selectbox for that trace is instantiated, so Streamlit widget-state
+    rules permit assigning NOT_REVIEWED.
+    """
+    previous = signatures.get(name)
+    changed = previous is not None and previous != new_signature
+    if changed:
+        session_state[f'approval_decision_{uid}'] = NOT_REVIEWED
+    signatures[name] = new_signature
+    return changed
 
 
 def preserve_trace_controls(session_state, uids):
@@ -156,7 +211,7 @@ def preserve_trace_controls(session_state, uids):
         entry = preserved.setdefault(uid, {})
         keys = [f'{uid}_{field}' for field in fields]
         keys.extend(f'{prefix}_{uid}' for prefix in
-                    ('approval_method', 'approval_primary', 'approval_note'))
+                    ('approval_method', 'approval_primary', 'approval_note', 'approval_decision'))
         for key in keys:
             if key in session_state:
                 entry[key] = session_state[key]
