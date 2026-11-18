@@ -176,8 +176,73 @@ def fit_transition(t: np.ndarray, a: np.ndarray) -> dict:
             'm_final_A_s': float(p[2]), 'k_obs_s_1': float(p[3]),
             't_half_s': float(np.log(2) / p[3]),
             'k_at_bound': bool(p[3] <= k_min * 1.02 or p[3] >= k_max * .98),
+            'k_bound_side': ('lower' if p[3] <= k_min * 1.02
+                             else 'upper' if p[3] >= k_max * .98 else 'none'),
             'success': bool(best.success), 'predicted_A': pred,
             **_metrics(a, pred, params=4)}
+
+
+def classify_timecourse(models: dict, min_aicc_improvement: float = 10.0,
+                        min_relative_slope_change: float = 0.10) -> dict:
+    """Exploratory screening of post-mixing progress-curve shapes.
+
+    The thresholds are heuristic (not a hypothesis test): a nonlinear model
+    must improve AICc by >=10 *and* show >=10% relative slope change before
+    the program calls the curvature meaningful. High-frequency assay points
+    may be serially correlated, so this must not be treated as evidence for
+    any specific inhibition mechanism or as a quantitative confidence level.
+
+    A fitted exponential k is interpreted only when exponential curvature is
+    supported and k is not at its fitting bound. A segmented fit alone can
+    suggest changing rates without establishing an exponential transition.
+    """
+    linear, transition, segmented = (models[k] for k in
+                                     ('linear', 'transition', 'segmented'))
+    def relative_change(fit):
+        a, b = float(fit['m_initial_A_s']), float(fit['m_final_A_s'])
+        return abs(b - a) / max(abs(a), abs(b), 1e-12)
+    exp_gain = float(linear['aicc'] - transition['aicc'])
+    seg_gain = float(linear['aicc'] - segmented['aicc'])
+    exp_fraction = relative_change(transition)
+    seg_fraction = relative_change(segmented)
+    exp_supported = (np.isfinite(exp_gain) and exp_gain >= min_aicc_improvement
+                     and exp_fraction >= min_relative_slope_change)
+    seg_supported = (np.isfinite(seg_gain) and seg_gain >= min_aicc_improvement
+                     and seg_fraction >= min_relative_slope_change)
+    side = transition.get('k_bound_side', 'bound' if transition['k_at_bound'] else 'none')
+    if not exp_supported and not seg_supported:
+        label = 'No detectable time-dependent change'
+        reason = ('Neither nonlinear model meets both exploratory screening criteria '
+                  '(AICc improvement ≥10 and modeled slope change ≥10%). '
+                  'An exponential k at its bound is not meaningful when the trace is effectively linear.')
+        next_step = ('Use a single post-mixing linear window for an initial velocity if the '
+                     'initial-rate assumptions are satisfied; keep this trace as a low-pyruvate '
+                     'comparison. Do not interpret k_obs. Check residuals and replicates.')
+    elif exp_supported and not transition['k_at_bound']:
+        label = 'Detectable time-dependent change'
+        reason = ('The exponential model meets the exploratory evidence and effect-size '
+                  'criteria, and k_obs did not reach a fitting bound. This is a change '
+                  'in rate, not proof of inhibition or adduct formation.')
+        next_step = ('Inspect residuals, verify the cutoff and early/late windows, and '
+                     'repeat the experiment. Test for NADH depletion, product accumulation '
+                     'and pyruvate-dependent absorbance before comparing k_obs across [pyruvate].')
+    else:
+        label = 'Transition rate unresolved'
+        if exp_supported and transition['k_at_bound']:
+            why = f'The exponential k_obs is at its {side} fitting bound.'
+        else:
+            why = 'The segmented fit suggests a changing slope, but the exponential rate is not well supported.'
+        reason = why + ' Curvature may be present, but k_obs should not be interpreted.'
+        next_step = ('Inspect the trace and mixing cutoff. For a possible rapid event, '
+                     'reduce mixing dead time or use faster acquisition; for a slow event, '
+                     'collect a longer time course while monitoring depletion. Repeat and '
+                     'compare with matched controls. Do not report a quantitative k_obs.')
+    return {'label': label, 'reason': reason, 'next_step': next_step,
+            'exponential_aicc_gain': exp_gain, 'segmented_aicc_gain': seg_gain,
+            'exponential_relative_slope_change': exp_fraction,
+            'segmented_relative_slope_change': seg_fraction,
+            'k_bound_side': side,
+            'k_interpretable': label == 'Detectable time-dependent change'}
 
 
 def fit_segmented(t: np.ndarray, a: np.ndarray, min_points_each: int = 6) -> dict:
